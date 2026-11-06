@@ -1,5 +1,5 @@
 <script setup>
-import { computed } from 'vue'
+import { computed, ref } from 'vue'
 import { Anchor, ArrowUp, Check, ChevronDown, ChevronRight, CircleAlert, Archive, Clock3, File, Folder, LoaderCircle, LockKeyhole, LogOut, Menu, MessageSquare, MoreHorizontal, PanelLeftClose, Pencil, Plus, Search, Square, Sparkles, UserRound, X } from 'lucide-vue-next'
 import { useHaven } from './useHaven.js'
 import { groupMessages, imageBlocks, messageText } from './messages.js'
@@ -23,15 +23,48 @@ const { controls, controlsSyncing, answerControl, respondControl, refreshControl
 const { groups, groupFilter, selectedGroup, sessionAction, groupDialog, organizationBusy, organizationError, actionBlocked, openSessionActions, openGroupDialog, organizeSession, saveGroup, deleteGroup, deleteSession } = haven
 const activeGroup = computed(() => groups.value.find(g => g.id === groupFilter.value))
 const turns = computed(() => groupMessages(messages.value, { text: liveText.value, tools: tools.value, busy: isBusy.value }))
+const sidebarMinWidth = 272
+const sidebarMaxWidth = 480
+const sidebarWidth = ref(sidebarMinWidth)
+const sidebarResizing = ref(false)
+const sidebarResizeStart = ref(null)
+function maxSidebarWidth() {
+  return Math.max(sidebarMinWidth, Math.min(sidebarMaxWidth, Math.floor(window.innerWidth * 0.48)))
+}
+function startSidebarResize(event) {
+  if (event.button !== 0) return
+  sidebarResizeStart.value = { pointerId: event.pointerId, x: event.clientX, width: sidebarWidth.value }
+  sidebarResizing.value = true
+  event.currentTarget.setPointerCapture(event.pointerId)
+}
+function moveSidebarResize(event) {
+  const start = sidebarResizeStart.value
+  if (!start || start.pointerId !== event.pointerId) return
+  sidebarWidth.value = Math.min(maxSidebarWidth(), Math.max(sidebarMinWidth, start.width + event.clientX - start.x))
+}
+function endSidebarResize(event) {
+  if (sidebarResizeStart.value?.pointerId !== event.pointerId) return
+  sidebarResizeStart.value = null
+  sidebarResizing.value = false
+}
+function resizeSidebarWithKeyboard(event) {
+  const step = 16
+  if (event.key === 'ArrowLeft') sidebarWidth.value = Math.max(sidebarMinWidth, sidebarWidth.value - step)
+  else if (event.key === 'ArrowRight') sidebarWidth.value = Math.min(maxSidebarWidth(), sidebarWidth.value + step)
+  else if (event.key === 'Home') sidebarWidth.value = sidebarMinWidth
+  else if (event.key === 'End') sidebarWidth.value = maxSidebarWidth()
+  else return
+  event.preventDefault()
+}
 </script>
 <template>
   <div v-if="logged === null" class="splash"><LoaderCircle class="spin" :size="22" /></div>
   <div v-else-if="!logged" class="login-page">
     <div class="login-card"><div class="brand-mark large"><Anchor :size="24" /></div><div class="eyebrow">YOUR SPACE TO THINK</div><h1>Hermes Haven</h1><p>使用你的 Hermes Dashboard 账号登录</p><form @submit.prevent="login"><div class="login-field"><label for="username">Hermes 用户名</label><div class="password-wrap"><UserRound :size="17"/><input id="username" v-model="username" name="username" autocomplete="username" placeholder="输入 Hermes 用户名" :disabled="signingIn" required autofocus></div></div><div class="login-field"><label for="password">密码</label><div class="password-wrap"><LockKeyhole :size="17"/><input id="password" v-model="password" name="password" type="password" autocomplete="current-password" placeholder="输入 Hermes 密码" :disabled="signingIn" required></div></div><div v-if="loginError" class="form-error" role="alert">{{ loginError }}</div><button class="login-button" :disabled="signingIn || !username.trim() || !password">{{ signingIn ? '正在验证…' : '进入 Haven' }} <ArrowUp class="arrow-diagonal" :size="17"/></button></form><div class="login-foot"><span class="dot"></span> YOUR PERSONAL HERMES WORKSPACE</div></div>
   </div>
-  <div v-else class="app-shell">
+  <div v-else class="app-shell" :class="{'sidebar-resizing':sidebarResizing}">
     <div v-if="sidebar" class="mobile-backdrop" @click="sidebar=false"></div>
-    <aside class="sidebar" :class="{open:sidebar}">
+    <aside class="sidebar" :class="{open:sidebar}" :style="{'--sidebar-width':`${sidebarWidth}px`}">
       <div class="sidebar-brand"><div class="brand-mark"><Anchor :size="18" /></div><div><strong>Hermes Haven</strong><small>YOUR AI WORKSPACE</small></div><button class="icon-button mobile-only side-close" title="收起侧栏" @click="sidebar=false"><PanelLeftClose :size="18"/></button></div>
       <button class="new-chat" @click="openNewSession"><Plus :size="17"/> <span>新建会话</span></button>
       <div class="search-box"><Search :size="14"/><input v-model="filter" placeholder="搜索会话" aria-label="搜索会话"></div>
@@ -41,6 +74,7 @@ const turns = computed(() => groupMessages(messages.value, { text: liveText.valu
       <div class="session-heading"><span>{{ section==='archive'?'已归档':activeGroup?.name||'最近会话' }}</span><span>{{ filtered.length }}{{ hasMoreSessions?'+':'' }}</span></div>
       <div ref="sessionList" class="session-list" @scroll.passive="onSessionsScroll"><div v-for="s in filtered" :key="s.id" class="session-item" :class="{active:selected?.id===s.id}"><button class="session-row" :class="{active:selected?.id===s.id}" @click="choose(s)"><MessageSquare :size="15"/><span class="session-name">{{ sessionTitle(s) }}<small v-if="s.deletion_pending">删除待完成</small></span><span class="session-time">{{ timeLabel(s.last_active || s.started_at) }}</span></button><button class="session-more icon-button" :aria-label="'管理会话：'+sessionTitle(s)" title="分组、归档或删除" @click="openSessionActions(s)"><MoreHorizontal :size="16"/></button></div><div v-if="searching||sessionsLoading" class="empty-list" role="status"><LoaderCircle :size="14" class="spin"/> 正在加载更多会话…</div><div v-else-if="sessionsError" class="empty-list" role="status">{{ sessionsError }} <button class="session-retry" @click="loadMoreSessions">重试</button></div><div v-else-if="!filtered.length" class="empty-list">{{ filter?'没有找到相关会话':section==='archive'?'暂无归档会话':groupFilter?'此分组暂无会话':'还没有会话，开始聊聊吧' }}</div></div>
       <div class="sidebar-footer"><div class="connection"><span class="status-dot" :class="health"></span><span>{{ health==='online'?'Hermes 已连接':health==='connecting'?'正在连接':'Hermes 未连接' }}</span><button class="icon-button" title="刷新连接" @click="checkHealth"><Sparkles :size="15"/></button></div><button class="account" @click="logout"><span class="avatar small">H</span><span><strong>{{ identity.display_name || identity.username || '个人空间' }}</strong><small>点击安全退出</small></span><LogOut :size="16"/></button></div>
+      <div class="sidebar-resizer" role="separator" aria-orientation="vertical" aria-label="调整侧栏宽度" :aria-valuemin="sidebarMinWidth" :aria-valuemax="maxSidebarWidth()" :aria-valuenow="Math.round(sidebarWidth)" tabindex="0" @pointerdown.prevent="startSidebarResize" @pointermove="moveSidebarResize" @pointerup="endSidebarResize" @pointercancel="endSidebarResize" @lostpointercapture="endSidebarResize" @keydown="resizeSidebarWithKeyboard"></div>
     </aside>
     <main class="main"><header class="topbar"><button class="icon-button mobile-only" title="打开侧栏" @click="sidebar=true"><Menu :size="20"/></button><div class="breadcrumb"><span>工作空间</span><ChevronRight :size="14"/><strong>{{ selected?selectedTitle:'对话' }}</strong><span v-if="selected&&!mine" class="readonly-pill">{{ sourceName(selected.source) }}</span></div><div class="top-actions"><button v-if="selected&&mine" class="icon-button" title="重命名" @click="startRename"><Pencil :size="16"/></button><button v-if="selected" class="icon-button" aria-label="管理当前会话" title="分组、归档或删除" @click="openSessionActions()"><MoreHorizontal :size="18"/></button><div class="top-profile"><span class="avatar tiny">H</span><span>我的空间</span><ChevronDown :size="14"/></div></div></header>
       <div v-if="globalNotice&&!selected" class="global-notice notice" role="status"><CircleAlert :size="16"/><span>{{ globalNotice }}</span><button class="icon-button" @click="globalNotice=''"><X :size="15"/></button></div>

@@ -26,7 +26,11 @@ button{cursor:pointer}
 button:disabled{cursor:not-allowed;opacity:1}
 button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 .app-shell{display:flex;height:100dvh;overflow:hidden}
-.sidebar{width:272px;flex:none;background:var(--surface-sidebar);border-right:1px solid var(--line);display:flex;flex-direction:column;padding:26px 17px 14px}
+.sidebar{position:relative;width:var(--sidebar-width,272px);min-width:272px;max-width:min(480px,48vw);flex:none;background:var(--surface-sidebar);border-right:1px solid var(--line);display:flex;flex-direction:column;padding:26px 17px 14px}
+.sidebar-resizer{position:absolute;z-index:5;top:0;right:-4px;bottom:0;width:8px;cursor:col-resize;touch-action:none}
+.sidebar-resizer::after{position:absolute;top:0;bottom:0;left:3px;width:2px;background:transparent;content:""}
+.sidebar-resizer:hover::after,.sidebar-resizer:focus-visible::after{background:var(--accent)}
+.app-shell.sidebar-resizing,.app-shell.sidebar-resizing *{cursor:col-resize!important;user-select:none!important}
 .sidebar-brand{display:flex;align-items:center;gap:10px;padding:1px 7px 26px}
 .brand-mark{height:36px;width:36px;display:grid;place-items:center;border-radius:11px;background:var(--accent);color:var(--surface)}
 .brand-mark.large{height:52px;width:52px;border-radius:16px;margin:auto auto 25px}
@@ -42,7 +46,7 @@ button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-vis
 .nav-tabs button{padding:4px 0 11px;background:none;border:0;border-bottom:2px solid transparent;font-size:13px;color:var(--text-muted)}
 .nav-tabs button.active{color:var(--accent);border-color:var(--accent);font-weight:700}
 .session-heading{display:flex;align-items:center;justify-content:space-between;padding:22px 8px 9px;color:var(--text-muted);font-size:11px;letter-spacing:.4px;font-weight:600}
-.session-list{overflow:auto;flex:1;min-height:0}
+.session-list{overflow:auto;flex:1;min-height:0;margin-right:-17px}
 .session-row{display:flex;align-items:center;gap:9px;width:100%;height:39px;text-align:left;background:none;border:0;border-radius:7px;color:var(--text-secondary);padding:0 9px;font-size:13px}
 .session-row svg{flex:none;color:var(--text-muted)}
 .session-row:hover{background:#f0f3f9;color:var(--text-strong)}
@@ -302,7 +306,8 @@ button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-vis
 .login-foot{margin-top:35px;font-size:9px;letter-spacing:.7px;color:var(--text-muted)}
 .dot{display:inline-block;width:6px;height:6px;background:#22a575;border-radius:50%;margin-right:4px}
 .form-error{color:#b34a37;font-size:11px;margin-top:8px}
-@media(max-width:700px){.sidebar{position:fixed;left:0;top:0;bottom:0;z-index:20;transform:translateX(-100%);transition:transform .2s ease;width:280px}
+@media(max-width:700px){.sidebar{position:fixed;left:0;top:0;bottom:0;z-index:20;transform:translateX(-100%);transition:transform .2s ease;width:min(280px,86vw);min-width:0;max-width:none}
+.sidebar-resizer{display:none}
 .sidebar.open{transform:translateX(0)}
 .mobile-backdrop{display:block;position:fixed;inset:0;background:#292333aa;z-index:19}
 .mobile-only{display:inline-grid}
