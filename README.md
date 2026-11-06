@@ -12,6 +12,7 @@ Hermes Haven 是面向个人使用的轻量 Web 界面，通过 Hermes 官方 AP
 - 工具失败原因、结果摘要及耗时；会话按需分页，标题搜索继续检索更早的页面。
 - 同一轮连续助手回复共用一个作者标识；历史工具调用默认折叠，展开后按调用编号集中查看参数和结果，实时执行与失败状态保持可见。
 - 图片选择、剪贴板粘贴、旧图片展示。
+- 生成图片直接显示原文件，点击可打开原图；兼容已有回复中的行内 `MEDIA:` 和 Markdown 图片引用。
 - 查看 Hermes 历史，并允许用户尝试继续原会话；Hermes 拒绝时直接显示原因，不自动重试或创建替代会话。
 - 不提供删除会话或修改历史消息的接口。当前不支持普通文档上传、审批交互、Studio 独有历史导入或全文搜索。
 
@@ -45,7 +46,7 @@ go build -o hermes-haven .
 | `HERMES_HISTORY_DB` | Hermes 当前 profile 的数据库；以只读方式展示完整历史 | 无 |
 | `HERMES_HISTORY_PYTHON` | 已安装 Hermes 的 Python 解释器 | `python3` |
 | `HERMES_SOURCE_DIR` | 已安装 Hermes 的源码目录 | `/usr/local/lib/hermes-agent` |
-| `HAVEN_IMAGE_ROOTS` | 允许读取历史图片的目录，按操作系统路径列表分隔 | `/root/.hermes-web-ui/upload:/root/.hermes/cache/documents/native-inputs` |
+| `HAVEN_IMAGE_ROOTS` | 允许读取历史和生成图片的目录，按操作系统路径列表分隔 | `/root/.hermes-web-ui/upload:/root/.hermes/cache/documents/native-inputs:/root/.hermes/cache/generated/images` |
 | `HAVEN_SECURE_COOKIE` | HTTPS 反向代理下设为 `true` | `false` |
 
 Haven 将用户输入的账号密码通过 Dashboard 的 `/auth/password-login` 验证，再通过 `/api/auth/me` 确认身份。密码不落盘、不写日志，Hermes 返回的 Cookie 不返回浏览器；Haven 只保留自己的内存登录状态，有效期不超过本次 Hermes 身份的到期时间和 24 小时，服务重启后需要重新登录。到期后重新输入 Hermes 账号即可；不持有上游刷新令牌。
@@ -83,6 +84,10 @@ Haven 不调用 Hermes 的会话删除、消息修改、历史截断或历史分
 完整历史使用 Hermes 自带的 `SessionDB(read_only=True)`，并启用 SQLite 连接的 `query_only`，避免官方完整消息 HTTP 接口对旧记录的显示索引自动回填。读取脚本随二进制内置，保存到 Haven 自己的数据目录；子进程禁止惰性安装和字节码写入。当前服务器配置数据库 `/root/.hermes/state.db`、解释器 `/usr/local/lib/hermes-agent/venv/bin/python`。不修改 Hermes 的代码或配置。
 
 配置只读数据库后，服务启动时会先检查读取能力，失败时不回退到可能写入旧索引的完整历史接口。未配置只读数据库时，HTTP 路径只取活动消息，并在旧会话页面提示完整历史暂未启用。
+
+## 生成图片展示
+
+图片工具保存在默认生成缓存目录的 PNG、JPEG、GIF、WebP，可通过助手回复中明确给出的图片引用直接展示。已有回复同样生效，无需重新生成；图片使用绑定会话和消息的加密地址读取原文件，继续检查登录、允许目录、符号链接解析后的路径和真实图片类型，不修改历史消息。缓存图片依赖原文件存在，不补建旧附件记录；本次输出目录中已登记的图片仍使用稳定副本。
 
 ## 恢复与重试
 

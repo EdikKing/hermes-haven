@@ -117,6 +117,9 @@ button:focus-visible,input:focus-visible,textarea:focus-visible{outline:2px soli
 .prose code{background:var(--accent-soft);border-radius:3px;padding:2px 4px}
 .prose pre code{padding:0;background:transparent}
 .prose img,.message-images img{max-width:min(100%,330px);max-height:250px;border-radius:8px;border:1px solid var(--line)}
+/* 助手图片直接加载原文件，按会话宽度等比显示，点击可打开原图。 */
+.message.assistant .prose img{display:block;max-width:min(100%,640px);max-height:none;height:auto}
+.message.assistant .prose a:has(>img){display:block;width:fit-content;max-width:100%;cursor:zoom-in}
 .prose blockquote{border-left:3px solid var(--accent-line);margin-left:0;padding-left:14px;color:var(--text-secondary)}
 .prose table{border-collapse:collapse;max-width:100%;display:block;overflow:auto}
 .prose td,.prose th{border:1px solid var(--line);padding:6px 10px}

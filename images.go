@@ -10,7 +10,9 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"path/filepath"
 	"regexp"
+	"strings"
 	"time"
 )
 
@@ -80,3 +82,31 @@ func (s *server) readImageReference(token, session, message string, index int) (
 }
 
 var uploadID = regexp.MustCompile(`^[a-f0-9]{40}$`)
+
+func imageMarkdown(src string) string {
+	return "\n\n[![生成图片](" + src + ")](" + src + " \"查看原图\")\n\n"
+}
+
+// 只为消息明确引用、且位于图片允许目录中的栅格图片签发原图地址。
+// 实际读取时仍会检查登录、符号链接解析后的目录、文件大小和真实类型。
+func (s *server) generatedImageReference(session, message string, index int, path string) string {
+	if !filepath.IsAbs(path) {
+		return ""
+	}
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".png", ".jpg", ".jpeg", ".gif", ".webp":
+	default:
+		return ""
+	}
+	for _, root := range s.imageRoots {
+		base, err := filepath.Abs(root)
+		if err != nil {
+			continue
+		}
+		rel, err := filepath.Rel(base, path)
+		if err == nil && rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel) {
+			return s.imageReference(session, message, index, path)
+		}
+	}
+	return ""
+}

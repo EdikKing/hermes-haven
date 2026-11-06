@@ -139,7 +139,8 @@ func newServer() (*server, error) {
 	if err = s.prepareHistoryReader(); err != nil {
 		return nil, err
 	}
-	for _, root := range filepath.SplitList(env("HAVEN_IMAGE_ROOTS", "/root/.hermes-web-ui/upload:/root/.hermes/cache/documents/native-inputs")) {
+	defaultImageRoots := strings.Join([]string{"/root/.hermes-web-ui/upload", "/root/.hermes/cache/documents/native-inputs", "/root/.hermes/cache/generated/images"}, string(os.PathListSeparator))
+	for _, root := range filepath.SplitList(env("HAVEN_IMAGE_ROOTS", defaultImageRoots)) {
 		if root != "" {
 			s.imageRoots = append(s.imageRoots, root)
 		}

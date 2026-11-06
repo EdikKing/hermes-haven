@@ -482,7 +482,8 @@ func (s *server) submissionInput(id, request, text string, images, files []strin
 	return []any{map[string]any{"role": "user", "content": parts}}, contextNote, output, nil
 }
 
-var artifactLink = regexp.MustCompile(`!?\[[^\]\r\n]*\]\((?:<([^>\r\n]+)>|([^\s)]+))\)|(?m)^MEDIA:\s*(?:"([^"\r\n]+)"|'([^'\r\n]+)'|([^\r\n]+))`)
+// 保留独占一行的旧引用，并识别正文或反引号中的 MEDIA 引用。
+var artifactLink = regexp.MustCompile(`!?\[[^\]\r\n]*\]\((?:<([^>\r\n]+)>|([^\s)]+))\)|(?m)^MEDIA:[ \t]*(?:"([^"\r\n]+)"|'([^'\r\n]+)'|([^\r\n]+))|\x60?\bMEDIA:[ \t]*(?:"([^"\r\n]+)"|'([^'\r\n]+)'|([^\s\x60<>"']+))\x60?`)
 
 func artifactPath(match string) string {
 	groups := artifactLink.FindStringSubmatch(match)
@@ -590,6 +591,7 @@ func (s *server) decorateAttachments(ctx context.Context, session string, rows [
 		}
 		var attached []any
 		seen := map[string]bool{}
+		imageIndex := 0
 		var originalText *string
 		transform := func(content string) string {
 			if message["role"] == "user" {
@@ -668,7 +670,15 @@ func (s *server) decorateAttachments(ctx context.Context, session string, rows [
 							attached = append(attached, a.public())
 							seen[a.ID] = true
 						}
+						if a.Kind == "image" {
+							return imageMarkdown("/api/uploads/" + a.ID + "/preview")
+						}
 						return "[" + strings.NewReplacer("[", "", "]", "").Replace(a.Name) + "](/api/uploads/" + a.ID + "/download)"
+					}
+					// 图片工具可能使用自身缓存目录；旧回复也能按已有引用直接显示原图。
+					if src := s.generatedImageReference(session, fmt.Sprint(message["id"]), imageIndex, path); src != "" {
+						imageIndex++
+						return imageMarkdown(src)
 					}
 					if strings.HasPrefix(path, s.dataDir) || strings.HasPrefix(link, "MEDIA:") || strings.Contains(link, "sandbox:") {
 						message["attachment_notice"] = "此文件没有可核实的本次输出目录，暂不提供下载。"
