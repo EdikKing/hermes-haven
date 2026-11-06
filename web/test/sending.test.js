@@ -24,6 +24,7 @@ function backend(options = {}) {
   const server = {
     streams: [], submissions: 0, run: false, status: 'running', request: null,
     settings: { one: {}, two: {} }, createdSettings: null, settingsFailure: false,
+    contextFailure: false, contextDelays: [],
     history: {
       one: [{ id: 1, role: 'user', content: '再解释一下' }, { id: 2, role: 'assistant', content: '上一轮的回复' }],
       two: [{ id: 10, role: 'user', content: '另一个会话' }],
@@ -41,6 +42,13 @@ function backend(options = {}) {
         return reply({ id: 'new_session', title: '新会话', settings: server.createdSettings }, 201)
       }
       if (path === '/api/sessions') return reply({ data: Object.keys(server.history).map(id => ({ id, owned: true, title: id })), has_more: false })
+      const context = path.match(/^\/api\/sessions\/([^/]+)\/context$/)
+      if (context) {
+        if (server.contextFailure) return reply({ error: '上下文读取暂不可用' }, 503)
+        const data = { used_tokens: context[1] === 'one' ? 34800 : null, max_tokens: server.settings[context[1]]?.model === 'model-b' ? 64000 : 1050000 }
+        if (server.contextDelays.length) await server.contextDelays.shift()
+        return reply(data)
+      }
       const settings = path.match(/^\/api\/sessions\/([^/]+)\/settings$/)
       if (settings) {
         if (server.settingsFailure) return reply({ error: '设置服务暂不可用' }, 503)
@@ -251,5 +259,27 @@ test('设置保存失败回到原选择，读取失败时禁止带错误默认�
     server.settingsFailure = false; await h.loadSettings()
     assert.equal(h.settingsBlocked.value, false)
     assert.equal(h.settingsError.value, '')
+  } finally { client.dispose() }
+})
+
+test('上下文按会话隔离，切换模型重算容量，旧响应不覆盖新容量且断网保留已知计数', async () => {
+  const server = backend(), client = await mount(server), h = client.haven
+  try {
+    await until(() => h.contextUsage.value?.used_tokens === 34800)
+    let release
+    server.contextDelays.push(new Promise(resolve => { release = resolve }))
+    const old = h.loadContext('one', true)
+    await h.saveSettings({ model: 'model-b', provider: 'provider-a', reasoning_effort: 'low' })
+    await until(() => h.contextUsage.value?.max_tokens === 64000)
+    release(); await old
+    assert.equal(h.contextUsage.value.max_tokens, 64000)
+    server.contextFailure = true; await h.loadContext('one', true)
+    assert.equal(h.contextUsage.value.used_tokens, 34800)
+    assert.match(h.contextError.value, /暂不可用/)
+    server.contextFailure = false
+    await h.choose(h.sessions.value.find(row => row.id === 'two'))
+    await until(() => h.contextUsage.value?.max_tokens === 1050000)
+    assert.equal(h.contextUsage.value.used_tokens, null)
+    assert.equal(server.submissions, 0)
   } finally { client.dispose() }
 })

@@ -16,6 +16,8 @@ export function useHaven() {
 
   const logged = ref(null), username = ref(''), password = ref(''), identity = ref({}), loginError = ref(''), signingIn = ref(false)
   const sessions = ref([]), filter = ref(''), section = ref('mine'), selected = ref(null), messages = ref([]), loading = ref(false)
+  const groups = ref([]), groupFilter = ref(''), sessionAction = ref(null), groupDialog = ref(null), organizationBusy = ref(false), organizationError = ref('')
+  const removedSessions = new Set()
   const sidebar = ref(false), editing = ref(false), titleDraft = ref(''), hasOlder = ref(false), scroller = ref(null), picker = ref(null)
   const health = ref('connecting'), sessionsLoading = ref(false), hasMoreSessions = ref(false), searching = ref(false), olderLoading = ref(false), globalNotice = ref('')
   const olderError = ref('')
@@ -25,6 +27,8 @@ export function useHaven() {
   const modelCatalog = ref({ providers: [], model: '', provider: '' }), modelsLoading = ref(false), modelsError = ref('')
   const newSessionOpen = ref(false), newSessionSettings = ref(normalizeSettings()), creatingSession = ref(false), newSessionError = ref('')
   const newSessionDefaults = ref(normalizeSettings())
+  const contextData = reactive({}), contextVersions = reactive({}), contextErrors = reactive({}), contextLoadingIDs = reactive(new Set())
+  let contextTimer = null
   const sessionModels = reactive({}), settingsReady = reactive({}), settingsErrors = reactive({}), settingsSavingIDs = reactive(new Set()), settingsLoadingIDs = reactive(new Set())
   const controlDrafts = reactive({})
   let workspace = null, stream = null, pollTimer = null, searchTimer = null, checkpointTimer = null, statusTimer = null
@@ -32,6 +36,7 @@ export function useHaven() {
   let modelsEpoch = 0
   let historyEpoch = 0, historyTimer = null, historyFailures = 0, historyRefreshing = false
 
+  function isRemoved(id) { return removedSessions.has(id) || workspace?.deleted(id) }
   function view(id) { return runs[id] || (runs[id] = emptyRun()) }
   function draft(id) { return drafts[id] || (drafts[id] = workspace?.draft(id) || emptyDraft()) }
   function persist(id) { if (workspace && drafts[id]) workspace.saveDraft(id, drafts[id]) }
@@ -61,15 +66,29 @@ export function useHaven() {
   const uploading = computed(() => uploadQueue.value.length)
   const isBusy = computed(() => activeStatuses.has(status.value))
   const isUncertain = computed(() => uncertainStatuses.has(status.value))
-  const composerLocked = computed(() => isBusy.value || isUncertain.value || sending.value || Boolean(pending.value))
+  const composerLocked = computed(() => selected.value?.archived || selected.value?.deletion_pending || isBusy.value || isUncertain.value || sending.value || Boolean(pending.value))
   const currentSettings = computed(() => normalizeSettings(selected.value ? sessionModels[selected.value.id] : null))
   const settingsSaving = computed(() => Boolean(selected.value && settingsSavingIDs.has(selected.value.id)))
   const settingsLoading = computed(() => Boolean(selected.value && settingsLoadingIDs.has(selected.value.id)))
   const settingsBlocked = computed(() => Boolean(selected.value && (!settingsReady[selected.value.id] || settingsLoading.value || settingsSaving.value)))
   const settingsError = computed(() => selected.value ? settingsErrors[selected.value.id] || '' : '')
+  const contextUsage = computed(() => selected.value ? contextData[selected.value.id] || null : null)
+  const contextLoading = computed(() => Boolean(selected.value && contextLoadingIDs.has(selected.value.id)))
+  const contextError = computed(() => selected.value ? contextErrors[selected.value.id] || '' : '')
   const mine = computed(() => selected.value?.owned === true)
   const notice = computed({ get: () => currentView.value.notice || globalNotice.value, set: value => { if (selected.value) { globalNotice.value = ''; view(selected.value.id).notice = value } else globalNotice.value = value } })
-  const filtered = computed(() => sessions.value.filter(s => (section.value === 'mine' ? s.owned : !s.owned) && sessionTitle(s).toLowerCase().includes(filter.value.toLowerCase())))
+  const filtered = computed(() => sessions.value.filter(s =>
+    (section.value === 'archive' ? s.archived : !s.archived) &&
+    (section.value !== 'mine' || s.owned) && (section.value !== 'history' || !s.owned) &&
+    (!groupFilter.value || (groupFilter.value === 'ungrouped' ? !s.group_id : s.group_id === groupFilter.value)) &&
+    sessionTitle(s).toLowerCase().includes(filter.value.trim().toLowerCase())))
+  const selectedGroup = computed(() => groups.value.find(g => g.id === selected.value?.group_id)?.name || '')
+  const actionBlocked = computed(() => {
+    const row = sessionAction.value
+    if (!row || row.deletion_pending) return ''
+    if (sendingIDs.has(row.id) || activeStatuses.has(view(row.id).status) || uncertainStatuses.has(view(row.id).status) || draft(row.id).pending) return '会话正在运行或发送结果待核对，请先停止并核对状态。'
+    return uploadingIDs[row.id]?.length ? '附件正在上传，请等待上传结束后再删除。' : ''
+  })
   const selectedTitle = computed(() => selected.value ? sessionTitle(selected.value) : '一个安静的地方，和 Hermes 一起思考')
   const statusLabel = computed(() => controls.value.length ? (controls.value.some(p => p.kind === 'approval') ? '等待审批' : '等待补充回答') : ({ queued: '正在排队', started: '正在开始', running: '正在思考', waiting_for_approval: '等待审批', stopping: '正在停止', completed: '已完成', failed: '运行失败', cancelled: '已停止', interrupted: '运行中断', unknown: '运行结果待核对', submission_unknown: '发送结果待核对' }[status.value] || '本次运行'))
   const sourceName = source => ({ api_server: 'API', cli: 'CLI', oneshot: 'CLI', weixin: '微信', feishu: '飞书', telegram: 'Telegram', tui: 'TUI', cron: '定时任务' }[source] || source || 'Hermes')
@@ -83,13 +102,15 @@ export function useHaven() {
     if (statusTimer) { clearTimeout(statusTimer); statusTimer = null }
   }
   function savePreferences() {
-    workspace?.savePreferences({ section: section.value, newSessionSettings: newSessionDefaults.value, selected: selected.value ? { id: selected.value.id, title: selectedTitle.value, source: selected.value.source, owned: selected.value.owned } : null })
+    workspace?.savePreferences({ section: section.value, groupFilter: groupFilter.value, newSessionSettings: newSessionDefaults.value, selected: selected.value ? { id: selected.value.id, title: selectedTitle.value, source: selected.value.source, owned: selected.value.owned, archived: selected.value.archived, group_id: selected.value.group_id, deletion_pending: selected.value.deletion_pending } : null })
   }
   function saveCheckpoint(id) { workspace?.saveCheckpoint(id, view(id)) }
   function expireLogin() {
     resetHistoryLoading()
+    stopContextRefresh()
     previewFile.value = null
     newSessionOpen.value = false
+    sessionAction.value = null; groupDialog.value = null
     const wasLogged = logged.value === true
     if (selected.value) saveCheckpoint(selected.value.id)
     savePreferences(); closeStream(); logged.value = false
@@ -121,10 +142,11 @@ export function useHaven() {
     try { await api('/api/logout', { method: 'POST', body: '{}' }) } catch (e) { if (e.status !== 401) { notice.value = '退出未完成，请恢复连接后重试。'; return } }
     savePreferences(); if (selected.value) saveCheckpoint(selected.value.id)
     resetHistoryLoading()
-    closeStream(); selectionEpoch++; listEpoch++; logged.value = false; selected.value = null; messages.value = []; password.value = ''; previewFile.value = null; newSessionOpen.value = false
+    stopContextRefresh(); closeStream(); selectionEpoch++; listEpoch++; logged.value = false; selected.value = null; messages.value = []; password.value = ''; previewFile.value = null; newSessionOpen.value = false; sessionAction.value = null; groupDialog.value = null
   }
   async function initialize() {
     resetHistoryLoading()
+    stopContextRefresh()
     closeStream(); selectionEpoch++; listEpoch++; searchEpoch++
     for (const key of Object.keys(drafts)) delete drafts[key]
     for (const key of Object.keys(runs)) delete runs[key]
@@ -133,21 +155,42 @@ export function useHaven() {
     for (const key of Object.keys(uploadingIDs)) delete uploadingIDs[key]
     for (const rows of [sessionModels, settingsReady, settingsErrors]) for (const key of Object.keys(rows)) delete rows[key]
     settingsSavingIDs.clear(); settingsLoadingIDs.clear(); newSessionOpen.value = false
+    for (const rows of [contextData, contextVersions, contextErrors]) for (const key of Object.keys(rows)) delete rows[key]
+    contextLoadingIDs.clear()
     modelsEpoch++; modelsLoading.value = false; modelCatalog.value = { providers: [], model: '', provider: '' }; modelsError.value = ''
     previewFile.value = null
     selected.value = null; messages.value = []; filter.value = ''; sessions.value = []; globalNotice.value = ''
+    groups.value = []; groupFilter.value = ''; sessionAction.value = null; groupDialog.value = null; organizationError.value = ''; organizationBusy.value = false; removedSessions.clear()
     workspace = createWorkspace(localStorage, identity.value.username, message => { globalNotice.value = message })
-    const prefs = workspace.preferences(); section.value = prefs.section === 'history' ? 'history' : 'mine'
+    const prefs = workspace.preferences(); section.value = ['all', 'mine', 'history', 'archive'].includes(prefs.section) ? prefs.section : 'all'
     newSessionDefaults.value = normalizeSettings(prefs.newSessionSettings); newSessionSettings.value = normalizeSettings(newSessionDefaults.value)
     loadModels()
     await Promise.all([loadSessions(), checkHealth()])
     if (!logged.value) return
-    if (prefs.selected?.id && /^[A-Za-z0-9_-]{1,160}$/.test(prefs.selected.id)) {
+    groupFilter.value = prefs.groupFilter === 'ungrouped' || groups.value.some(g => g.id === prefs.groupFilter) ? prefs.groupFilter : ''
+    scanSessions()
+    if (prefs.selected?.id && !isRemoved(prefs.selected.id) && /^[A-Za-z0-9_-]{1,160}$/.test(prefs.selected.id)) {
       const restored = sessions.value.find(s => s.id === prefs.selected.id) || prefs.selected
       await choose(restored)
     }
   }
   async function checkHealth() { try { await api('/api/health'); health.value = 'online' } catch { health.value = 'offline' } }
+  function stopContextRefresh() { clearTimeout(contextTimer); contextTimer = null }
+  function scheduleContextRefresh() {
+    stopContextRefresh()
+    if (!logged.value || !selected.value) return
+    contextTimer = setTimeout(async () => { contextTimer = null; if (logged.value && selected.value) { await loadContext(selected.value.id); scheduleContextRefresh() } }, isBusy.value ? 15000 : 60000)
+  }
+  async function loadContext(id = selected.value?.id, force = false) {
+    if (!id || !logged.value || (contextLoadingIDs.has(id) && !force)) return
+    const currentWorkspace = workspace, version = (contextVersions[id] || 0) + 1
+    contextVersions[id] = version; contextLoadingIDs.add(id)
+    try {
+      const data = await api(`/api/sessions/${id}/context`)
+      if (workspace === currentWorkspace && logged.value && contextVersions[id] === version) { contextData[id] = data; contextErrors[id] = '' }
+    } catch (e) { if (workspace === currentWorkspace && logged.value && contextVersions[id] === version) contextErrors[id] = e.message }
+    finally { if (workspace === currentWorkspace && contextVersions[id] === version) contextLoadingIDs.delete(id) }
+  }
   async function loadModels() {
     if (modelsLoading.value) return
     const currentWorkspace = workspace, epoch = ++modelsEpoch
@@ -162,7 +205,7 @@ export function useHaven() {
     settingsLoadingIDs.add(id); settingsErrors[id] = ''
     try {
       const value = await api(`/api/sessions/${id}/settings`)
-      if (workspace === currentWorkspace && logged.value) { sessionModels[id] = normalizeSettings(value); settingsReady[id] = true }
+      if (workspace === currentWorkspace && logged.value && !removedSessions.has(id)) { sessionModels[id] = normalizeSettings(value); settingsReady[id] = true; loadContext(id, true) }
     } catch (e) { if (workspace === currentWorkspace && logged.value) { settingsReady[id] = false; settingsErrors[id] = '无法读取会话设置：' + e.message } }
     finally { if (workspace === currentWorkspace) settingsLoadingIDs.delete(id) }
   }
@@ -173,12 +216,13 @@ export function useHaven() {
     sessionModels[id] = next; settingsSavingIDs.add(id); settingsErrors[id] = ''
     try {
       const saved = await api(`/api/sessions/${id}/settings`, { method: 'PUT', body: JSON.stringify(next) })
-      if (workspace !== currentWorkspace || !logged.value) return
+      if (workspace !== currentWorkspace || !logged.value || removedSessions.has(id)) return
       sessionModels[id] = normalizeSettings(saved)
+      loadContext(id, true)
       newSessionDefaults.value = normalizeSettings(saved)
       if (!newSessionOpen.value) newSessionSettings.value = normalizeSettings(saved)
       savePreferences()
-    } catch (e) { if (workspace === currentWorkspace && logged.value) { sessionModels[id] = previous; settingsErrors[id] = '设置未保存：' + e.message } }
+    } catch (e) { if (workspace === currentWorkspace && logged.value && !removedSessions.has(id)) { sessionModels[id] = previous; settingsErrors[id] = '设置未保存：' + e.message } }
     finally { if (workspace === currentWorkspace) settingsSavingIDs.delete(id) }
   }
   async function loadSessions(more = false) {
@@ -190,30 +234,31 @@ export function useHaven() {
       const data = await api('/api/sessions?offset=' + (more ? sessionOffset : 0))
       if (epoch !== listEpoch || !logged.value) return
       const rows = data.data || [], known = new Map((more ? sessions.value : []).map(s => [s.id, s]))
-      let added = 0
-      for (const row of rows) { if (!known.has(row.id)) added++; known.set(row.id, row) }
+      for (const row of rows) { if (!isRemoved(row.id)) known.set(row.id, row) }
       sessions.value = [...known.values()]
-      hasMoreSessions.value = Boolean(data.has_more) && rows.length > 0 && (!more || added > 0)
+      if (Array.isArray(data.groups)) groups.value = data.groups
+      hasMoreSessions.value = Boolean(data.has_more)
       sessionOffset = Number(data.offset || 0) + Number(data.limit || 200)
       if (selected.value) { const updated = known.get(selected.value.id); if (updated) selected.value = updated }
     } catch (e) { globalNotice.value = e.message } finally { if (epoch === listEpoch) sessionsLoading.value = false }
   }
   async function loadMoreSessions() { await loadSessions(true) }
-  watch(filter, value => {
+  function scanSessions() {
     clearTimeout(searchTimer); const epoch = ++searchEpoch
-    if (!value.trim()) { searching.value = false; return }
+    if (!filter.value.trim() && !groupFilter.value && section.value !== 'archive') { searching.value = false; return }
     searchTimer = setTimeout(async () => {
       searching.value = true
       try {
         // 标题只在已读取的数据中匹配，继续逐页读取；不调用可能修复或改写旧会话的标题接口。
         while (epoch === searchEpoch && logged.value && hasMoreSessions.value) {
-          if (sessionsLoading.value) break
+          if (sessionsLoading.value) { await new Promise(resolve => setTimeout(resolve, 30)); continue }
           const before = sessionOffset; await loadMoreSessions(); if (before === sessionOffset) break
         }
       } finally { if (epoch === searchEpoch) searching.value = false }
     }, 350)
-  })
-  watch(section, savePreferences)
+  }
+  watch([filter, section, groupFilter], scanSessions)
+  watch([section, groupFilter], savePreferences)
 
   function clearHistoryTimer() { clearTimeout(historyTimer); historyTimer = null }
   function resetHistoryLoading() {
@@ -226,7 +271,9 @@ export function useHaven() {
   }
   function scrollBottom() { nextTick(() => { if (scroller.value) { scroller.value.scrollTop = scroller.value.scrollHeight; onHistoryScroll() } }) }
   async function choose(session) {
+    if (isRemoved(session.id)) return
     resetHistoryLoading()
+    stopContextRefresh()
     if (selected.value) saveCheckpoint(selected.value.id)
     closeStream(); const epoch = ++selectionEpoch
     selected.value = session; draft(session.id); outgoingFor(session.id); editing.value = false; sidebar.value = false; messages.value = []; messageOffset = 0; hasOlder.value = false; loading.value = true
@@ -235,7 +282,7 @@ export function useHaven() {
     savePreferences()
     try { await Promise.all([loadMessages(false, epoch), loadSettings(session.id)]); if (epoch === selectionEpoch) await recover(session.id) }
     catch (e) { if (epoch === selectionEpoch) { view(session.id).notice = e.message; if (e.status === 404) { selected.value = null; savePreferences() } } }
-    finally { if (epoch === selectionEpoch) { loading.value = false; scrollBottom() } }
+    finally { if (epoch === selectionEpoch) { loading.value = false; scrollBottom(); scheduleContextRefresh() } }
   }
   async function loadMessages(older, epoch = selectionEpoch) {
     if (!selected.value) return
@@ -246,6 +293,7 @@ export function useHaven() {
       const data = await api(`/api/sessions/${encodeURIComponent(id)}/messages?offset=${next}`)
       // 刷新历史或切换会话后，旧分页响应不能覆盖新列表及其滚动位置。
       if (epoch !== selectionEpoch || revision !== historyEpoch || selected.value?.id !== id || !logged.value) return
+      if (data.organization) { Object.assign(selected.value, data.organization); const row = sessions.value.find(s => s.id === id); if (row) Object.assign(row, data.organization); savePreferences() }
       const rows = data.data || []
       if (data.history_notice) view(id).notice = data.history_notice
       const element = scroller.value, oldHeight = element?.scrollHeight || 0, oldTop = element?.scrollTop || 0
@@ -281,7 +329,7 @@ export function useHaven() {
       const data = await api('/api/sessions', { method: 'POST', body: JSON.stringify({ settings }) })
       const session = { id: data.id, owned: true, haven_title: data.title, source: 'api_server', settings: data.settings }
       newSessionDefaults.value = settings; newSessionOpen.value = false; savePreferences()
-      sessions.value.unshift(session); section.value = 'mine'; await choose(session)
+      sessions.value.unshift(session); section.value = 'mine'; groupFilter.value = ''; await choose(session)
     } catch (e) { newSessionError.value = e.message }
     finally { creatingSession.value = false }
   }
@@ -294,6 +342,75 @@ export function useHaven() {
       const row = sessions.value.find(s => s.id === id); if (row) row.haven_title = title
       if (selected.value?.id === id) { selected.value.haven_title = title; editing.value = false; savePreferences() }
     } catch (e) { view(id).notice = e.message }
+  }
+
+  function openSessionActions(session = selected.value) { sessionAction.value = session; groupDialog.value = null; organizationError.value = '' }
+  function openGroupDialog(group = null) { groupDialog.value = group ? { ...group } : { id: '', name: '' }; sessionAction.value = null; organizationError.value = '' }
+  function invalidateSessionList() { listEpoch++; sessionsLoading.value = false }
+  async function organizeSession(patch) {
+    if (!sessionAction.value || organizationBusy.value) return
+    const id = sessionAction.value.id, currentWorkspace = workspace
+    organizationBusy.value = true; organizationError.value = ''; invalidateSessionList()
+    try {
+      const meta = await api(`/api/sessions/${id}/organization`, { method: 'PUT', body: JSON.stringify(patch) })
+      if (workspace !== currentWorkspace || !logged.value) return
+      for (const row of [sessions.value.find(s => s.id === id), selected.value?.id === id ? selected.value : null, sessionAction.value?.id === id ? sessionAction.value : null]) if (row) Object.assign(row, meta)
+      savePreferences(); sessionAction.value = null
+    } catch (e) { if (workspace === currentWorkspace && logged.value) organizationError.value = e.message }
+    finally { if (workspace === currentWorkspace) organizationBusy.value = false }
+  }
+  async function saveGroup(name) {
+    if (!groupDialog.value || organizationBusy.value) return
+    const id = groupDialog.value.id, currentWorkspace = workspace
+    organizationBusy.value = true; organizationError.value = ''; invalidateSessionList()
+    try {
+      const result = await api('/api/groups' + (id ? '/' + id : ''), { method: id ? 'PUT' : 'POST', body: JSON.stringify({ name }) })
+      if (workspace !== currentWorkspace || !logged.value) return
+      groups.value = result.groups; groupDialog.value = null
+      if (!id) { groupFilter.value = result.id; section.value = 'all' }
+    } catch (e) { if (workspace === currentWorkspace && logged.value) organizationError.value = e.message }
+    finally { if (workspace === currentWorkspace) organizationBusy.value = false }
+  }
+  async function deleteGroup() {
+    if (!groupDialog.value?.id || organizationBusy.value) return
+    const id = groupDialog.value.id, currentWorkspace = workspace
+    organizationBusy.value = true; organizationError.value = ''; invalidateSessionList()
+    try {
+      const result = await api('/api/groups/' + id, { method: 'DELETE' })
+      if (workspace !== currentWorkspace || !logged.value) return
+      groups.value = result.groups
+      for (const row of [...sessions.value, selected.value]) if (row?.group_id === id) row.group_id = ''
+      if (groupFilter.value === id) groupFilter.value = ''
+      savePreferences(); groupDialog.value = null
+    } catch (e) { if (workspace === currentWorkspace && logged.value) organizationError.value = e.message }
+    finally { if (workspace === currentWorkspace) organizationBusy.value = false }
+  }
+  function forgetSession(id) {
+    removedSessions.add(id)
+    sessions.value = sessions.value.filter(s => s.id !== id)
+    if (selected.value?.id === id) {
+      resetHistoryLoading(); stopContextRefresh(); closeStream(); selectionEpoch++; selected.value = null; messages.value = []; loading.value = false; editing.value = false; previewFile.value = null
+    }
+    for (const rows of [drafts, runs, outgoing, uploadingIDs, sessionModels, settingsReady, settingsErrors, contextData, contextVersions, contextErrors]) delete rows[id]
+    for (const key of Object.keys(controlDrafts)) if (key.startsWith(id + ':')) delete controlDrafts[key]
+    workspace?.removeSession(id); savePreferences(); if (sessionAction.value?.id === id) sessionAction.value = null
+  }
+  async function deleteSession() {
+    if (!sessionAction.value || organizationBusy.value) return
+    const id = sessionAction.value.id, currentWorkspace = workspace
+    organizationBusy.value = true; organizationError.value = ''; invalidateSessionList()
+    try {
+      await api(`/api/sessions/${id}`, { method: 'DELETE', body: JSON.stringify({ confirmed: true }) })
+      if (workspace !== currentWorkspace || !logged.value) return
+      forgetSession(id)
+    } catch (e) {
+      if (workspace === currentWorkspace && logged.value) {
+        organizationError.value = e.message
+        const pending = typeof e.data?.deletion_pending === 'boolean' ? e.data.deletion_pending : Boolean(e.network || e.status >= 500)
+        for (const row of [sessions.value.find(s => s.id === id), selected.value?.id === id ? selected.value : null]) if (row) row.deletion_pending = pending
+        savePreferences()
+      }
+    } finally { if (workspace === currentWorkspace) organizationBusy.value = false }
   }
 
   async function uploadFiles(chosen) {
@@ -334,6 +451,7 @@ export function useHaven() {
     }
     if (current.runID !== runID) Object.assign(current, emptyRun(), { runID })
     current.status = nextStatus || 'started'; saveCheckpoint(id)
+    if (selected.value?.id === id) scheduleContextRefresh()
   }
   async function send() {
     if (!selected.value || composerLocked.value || settingsBlocked.value || uploading.value || (!text.value.trim() && !files.value.length)) return
@@ -416,7 +534,7 @@ export function useHaven() {
       if (result.terminal) {
         current.recoveryVersion = (current.recoveryVersion || 0) + 1
         closeStream(); current.connected = false; saveCheckpoint(id)
-        try { await loadMessages(false); if (current.runID === runID) { current.liveText = ''; current.tools = current.tools.filter(t => t.state === 'error'); saveCheckpoint(id) }; await loadSessions() }
+        try { await loadMessages(false); loadContext(id, true); if (current.runID === runID) { current.liveText = ''; current.tools = current.tools.filter(t => t.state === 'error'); saveCheckpoint(id) }; await loadSessions() }
         catch (e) { current.notice = '运行已结束，历史暂未恢复：' + e.message; scheduleRecover(id) }
       }
       scrollBottom()
@@ -424,7 +542,7 @@ export function useHaven() {
     es.onerror = () => { if (stream !== es) return; saveCheckpoint(id); closeStream(); current.connected = false; health.value = 'offline'; scheduleRecover(id) }
   }
   async function recover(id = selected.value?.id) {
-    if (!id || !logged.value) return
+    if (!id || !logged.value || removedSessions.has(id)) return
     const current = view(id)
     const accountWorkspace = workspace
     const recoveryVersion = (current.recoveryVersion || 0) + 1; current.recoveryVersion = recoveryVersion
@@ -432,7 +550,7 @@ export function useHaven() {
     try {
       if (draft(id).pending) await checkPending(id)
       const data = await api(`/api/sessions/${id}/status`)
-      if (!logged.value || accountWorkspace !== workspace || recoveryVersion !== current.recoveryVersion) return
+      if (!logged.value || accountWorkspace !== workspace || removedSessions.has(id) || recoveryVersion !== current.recoveryVersion) return
       clearConnectionNotice(current)
       if (data.status === 'submission_unknown') {
         if (!draft(id).pending) { draft(id).pending = { text: data.text || '', images: data.images || [], files: data.files || [], settings: data.settings, request_id: data.request_id, created_at: data.created_at ? Date.parse(data.created_at) : 1 }; persist(id) }
@@ -453,7 +571,7 @@ export function useHaven() {
       else current.retries = 0
       if (data.run_id) health.value = 'online'
     } catch (e) {
-      if (!logged.value || accountWorkspace !== workspace || recoveryVersion !== current.recoveryVersion) return
+      if (!logged.value || accountWorkspace !== workspace || removedSessions.has(id) || recoveryVersion !== current.recoveryVersion) return
       current.controlsVerified = false
       if (e.status === 404) { current.controls = []; current.status = 'unavailable'; current.notice = '实时运行记录已不可用，请以保存的会话历史为准。'; return }
       current.notice = '暂时无法核对运行状态：' + e.message; health.value = 'offline'; scheduleRecover(id)
@@ -524,6 +642,7 @@ export function useHaven() {
     if (logged.value && selected.value) { const id = selected.value.id; saveCheckpoint(id); closeStream(); view(id).notice = '网络已断开，草稿和发送记录已保留。恢复连接后会重新核对运行。'; scheduleRecover(id) }
   }
   function storageChanged(event) {
+    if (workspace && event.key?.startsWith(workspace.prefix + 'deleted:') && event.newValue === 'true') { forgetSession(event.key.slice((workspace.prefix + 'deleted:').length)); return }
     if (workspace && selected.value && event.key?.startsWith(workspace.prefix + 'control:' + selected.value.id + ':')) {
       const id = selected.value.id
       for (const p of view(id).controls) {
@@ -552,7 +671,7 @@ export function useHaven() {
     window.addEventListener('online', online); window.addEventListener('offline', offline); window.addEventListener('storage', storageChanged); window.addEventListener('pagehide', beforeUnload)
     try { identity.value = await api('/api/me'); logged.value = true; await initialize() } catch (e) { logged.value = false; if (e.network) loginError.value = '无法连接服务器，请恢复网络后重试。' }
   })
-  onUnmounted(() => { resetHistoryLoading(); beforeUnload(); closeStream(); clearTimeout(searchTimer); window.removeEventListener('online', online); window.removeEventListener('offline', offline); window.removeEventListener('storage', storageChanged); window.removeEventListener('pagehide', beforeUnload) })
+  onUnmounted(() => { resetHistoryLoading(); stopContextRefresh(); beforeUnload(); closeStream(); clearTimeout(searchTimer); window.removeEventListener('online', online); window.removeEventListener('offline', offline); window.removeEventListener('storage', storageChanged); window.removeEventListener('pagehide', beforeUnload) })
 
-  return { olderError, onHistoryScroll, modelCatalog, modelsLoading, modelsError, loadModels, currentSettings, settingsLoading, settingsSaving, settingsBlocked, settingsError, saveSettings, loadSettings, newSessionOpen, newSessionSettings, newSessionError, creatingSession, openNewSession, controls, controlsSyncing, answerControl, respondControl, refreshControls, logged, username, password, identity, loginError, signingIn, sessions, filter, section, selected, messages: visibleMessages, loading, sidebar, editing, titleDraft, hasOlder, scroller, picker, health, sessionsLoading, hasMoreSessions, searching, olderLoading, globalNotice, text, files, pending, status, tools, liveText, sending, uploading, uploadQueue, previewFile, openPreview, loadPreviewText, dropFiles, isBusy, isUncertain, composerLocked, mine, notice, filtered, selectedTitle, statusLabel, sourceName, sessionTitle, timeLabel, login, logout, checkHealth, loadMoreSessions, choose, createSession, startRename, rename, attach, pasteImages, removeImage, send, retryPending, acknowledgePending, refreshStatus, stop, render }
+  return { groups, groupFilter, selectedGroup, actionBlocked, sessionAction, groupDialog, organizationBusy, organizationError, openSessionActions, openGroupDialog, organizeSession, saveGroup, deleteGroup, deleteSession, olderError, onHistoryScroll, contextUsage, contextLoading, contextError, loadContext, modelCatalog, modelsLoading, modelsError, loadModels, currentSettings, settingsLoading, settingsSaving, settingsBlocked, settingsError, saveSettings, loadSettings, newSessionOpen, newSessionSettings, newSessionError, creatingSession, openNewSession, controls, controlsSyncing, answerControl, respondControl, refreshControls, logged, username, password, identity, loginError, signingIn, sessions, filter, section, selected, messages: visibleMessages, loading, sidebar, editing, titleDraft, hasOlder, scroller, picker, health, sessionsLoading, hasMoreSessions, searching, olderLoading, globalNotice, text, files, pending, status, tools, liveText, sending, uploading, uploadQueue, previewFile, openPreview, loadPreviewText, dropFiles, isBusy, isUncertain, composerLocked, mine, notice, filtered, selectedTitle, statusLabel, sourceName, sessionTitle, timeLabel, login, logout, checkHealth, loadMoreSessions, choose, createSession, startRename, rename, attach, pasteImages, removeImage, send, retryPending, acknowledgePending, refreshStatus, stop, render }
 }

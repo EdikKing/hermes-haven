@@ -32,7 +32,10 @@ type ownedSession struct {
 	Settings *modelSettings `json:"settings,omitempty"`
 }
 type state struct {
-	Sessions map[string]ownedSession `json:"sessions"`
+	Sessions     map[string]ownedSession        `json:"sessions"`
+	Groups       map[string]sessionGroup        `json:"groups,omitempty"`
+	Organization map[string]sessionOrganization `json:"organization,omitempty"`
+	Deletions    map[string]string              `json:"deletions,omitempty"`
 }
 type server struct {
 	mu                                                     sync.Mutex
@@ -50,6 +53,7 @@ type server struct {
 	submissions                                            *submissionStore
 	submitLocks                                            sync.Map
 	artifactMu                                             sync.Mutex
+	attachmentUseMu                                        sync.RWMutex
 }
 
 func randomID(n int) string {
@@ -133,6 +137,7 @@ func newServer() (*server, error) {
 	if s.st.Sessions == nil {
 		s.st.Sessions = map[string]ownedSession{}
 	}
+	s.initOrganization()
 	s.submissions, err = openSubmissions(filepath.Join(s.dataDir, "requests"))
 	if err != nil {
 		return nil, fmt.Errorf("读取发送记录失败: %w", err)
@@ -338,13 +343,24 @@ func (s *server) list(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rows, _ := data["data"].([]any)
+	visible := make([]any, 0, len(rows))
+	listed := map[string]bool{}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	for _, v := range rows {
 		row, ok := v.(map[string]any)
 		if !ok {
 			continue
 		}
 		id, _ := row["id"].(string)
-		own, tracked := s.owned(id)
+		if s.st.Deletions[id] == "deleted" {
+			continue
+		}
+		own, tracked := s.st.Sessions[id]
+		meta := s.st.Organization[id]
+		row["group_id"] = meta.GroupID
+		row["archived"] = meta.Archived
+		row["deletion_pending"] = s.st.Deletions[id] == "pending"
 		row["owned"] = tracked && !own.External
 		if tracked {
 			if !own.External {
@@ -353,7 +369,28 @@ func (s *server) list(w http.ResponseWriter, r *http.Request) {
 			row["run_id"] = own.RunID
 			row["settings"] = own.Settings
 		}
+		visible = append(visible, row)
+		listed[id] = true
 	}
+	// 上游已删除但本地清理失败时，保留可重试入口；刷新后也能继续完成删除。
+	if offset == 0 {
+		for id, stage := range s.st.Deletions {
+			if stage != "pending" || listed[id] {
+				continue
+			}
+			own, tracked := s.st.Sessions[id]
+			meta := s.st.Organization[id]
+			title := own.Title
+			if title == "" {
+				title = "删除待完成的会话"
+			}
+			visible = append(visible, map[string]any{"id": id, "title": title, "owned": tracked && !own.External, "group_id": meta.GroupID, "archived": meta.Archived, "deletion_pending": true})
+		}
+	}
+	data["data"] = visible
+	data["groups"] = s.groupRowsLocked()
+	data["offset"] = offset
+	data["limit"] = 200
 	jsonOut(w, 200, data)
 }
 func (s *server) create(w http.ResponseWriter, r *http.Request) {
@@ -512,6 +549,9 @@ func (s *server) api(w http.ResponseWriter, r *http.Request) {
 			s.models(w, r)
 			return
 		}
+	case "/api/groups":
+		s.groups(w, r, "")
+		return
 	case "/api/sessions":
 		if r.Method == "GET" {
 			s.list(w, r)
@@ -527,6 +567,15 @@ func (s *server) api(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if strings.HasPrefix(r.URL.Path, "/api/groups/") {
+		id := strings.TrimPrefix(r.URL.Path, "/api/groups/")
+		if !validID(id) {
+			fail(w, 404, "分组不存在")
+			return
+		}
+		s.groups(w, r, id)
+		return
+	}
 	if strings.HasPrefix(r.URL.Path, "/api/uploads/") && r.Method == "GET" {
 		p := strings.Split(strings.TrimPrefix(r.URL.Path, "/api/uploads/"), "/")
 		if len(p) == 1 {
@@ -539,12 +588,23 @@ func (s *server) api(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/api/sessions/"), "/")
-	if !strings.HasPrefix(r.URL.Path, "/api/sessions/") || len(parts) < 2 || !validID(parts[0]) {
+	if !strings.HasPrefix(r.URL.Path, "/api/sessions/") || !validID(parts[0]) {
 		fail(w, 404, "未找到")
 		return
 	}
 	id := parts[0]
+	if len(parts) == 1 && r.Method == "DELETE" {
+		s.deleteSession(w, r, id)
+		return
+	}
+	if s.sessionUnavailable(w, id) {
+		return
+	}
 	switch {
+	case len(parts) == 2 && parts[1] == "organization" && r.Method == "PUT":
+		s.organizeSession(w, r, id)
+	case len(parts) == 2 && parts[1] == "context" && r.Method == "GET":
+		s.contextUsage(w, r, id)
 	case len(parts) == 2 && parts[1] == "settings" && (r.Method == "GET" || r.Method == "PUT"):
 		s.sessionSettings(w, r, id)
 	case len(parts) == 2 && parts[1] == "messages" && r.Method == "GET":
@@ -585,7 +645,7 @@ func (s *server) api(w http.ResponseWriter, r *http.Request) {
 		defer s.mu.Unlock()
 		// 读取最新会话再只更新标题，保留同时保存的模型选择和运行关联。
 		own, ok = s.st.Sessions[id]
-		if !ok || own.External {
+		if !ok || own.External || s.st.Deletions[id] != "" {
 			fail(w, 403, "无法修改历史会话标题")
 			return
 		}
@@ -664,6 +724,14 @@ func (s *server) messages(w http.ResponseWriter, r *http.Request, id string) {
 				m["content"] = s.scrubContent(m["content"], id, m["id"])
 			}
 		}
+	}
+	if s.sessionUnavailable(w, id) {
+		return
+	}
+	if code == 200 {
+		s.mu.Lock()
+		v["organization"] = s.st.Organization[id]
+		s.mu.Unlock()
 	}
 	jsonOut(w, code, v)
 }

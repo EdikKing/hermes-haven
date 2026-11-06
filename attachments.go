@@ -520,6 +520,12 @@ func (s *server) registeredArtifact(rec submission, path string) (attachment, bo
 func (s *server) captureArtifact(rec submission, message, path string) (attachment, error) {
 	s.artifactMu.Lock()
 	defer s.artifactMu.Unlock()
+	s.mu.Lock()
+	deleting := s.st.Deletions[rec.SessionID] != ""
+	s.mu.Unlock()
+	if deleting {
+		return attachment{}, errors.New("会话正在删除或已删除")
+	}
 	indexDir := filepath.Join(s.dataDir, "file-links")
 	if err := os.MkdirAll(indexDir, 0700); err != nil {
 		return attachment{}, err

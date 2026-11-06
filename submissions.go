@@ -199,6 +199,19 @@ func (s *server) submit(w http.ResponseWriter, r *http.Request, id, requestID, t
 	mu := lock.(*sync.Mutex)
 	mu.Lock()
 	defer mu.Unlock()
+	// 并发会话先完成附件关联登记，删除清理才能判断附件是否仍被其他会话引用。
+	s.attachmentUseMu.RLock()
+	defer s.attachmentUseMu.RUnlock()
+	if s.sessionUnavailable(w, id) {
+		return
+	}
+	s.mu.Lock()
+	archived := s.st.Organization[id].Archived
+	s.mu.Unlock()
+	if archived {
+		fail(w, 409, "会话已归档，请先恢复后继续对话")
+		return
+	}
 	rec, exists := s.submissions.get(id, requestID)
 	if exists {
 		frozen := modelSettings{}

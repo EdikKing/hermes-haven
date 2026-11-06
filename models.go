@@ -72,6 +72,10 @@ func (s *server) sessionSettings(w http.ResponseWriter, r *http.Request, id stri
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.st.Deletions[id] != "" {
+		fail(w, 409, "会话正在删除或已删除")
+		return
+	}
 	old, exists := s.st.Sessions[id]
 	own := old
 	if !exists {

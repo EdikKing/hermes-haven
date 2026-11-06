@@ -69,7 +69,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.answer(200, {"user_id": "preview", "display_name": "本机预览", "provider": "basic", "expires_at": int(time.time()) + 3600})
         if path == "/v1/capabilities": return self.answer(200, {"features": {"run_submission": True, "runs_idempotency": {"supported": True, "durable": True, "retention_seconds": 86400}}})
         if path == "/api/model/options":
-            return self.answer(200, {"model": "preview-reasoner", "provider": "preview", "providers": [{"slug": "preview", "name": "本机预览", "authenticated": True, "models": ["preview-reasoner", "preview-fast", "preview-model-with-a-very-long-name-for-mobile-layout"], "capabilities": {"preview-reasoner": {"reasoning": True}, "preview-fast": {"reasoning": False}}}]})
+            return self.answer(200, {"model": "preview-reasoner", "provider": "preview", "providers": [{"slug": "preview", "name": "本机预览", "authenticated": True, "models": ["preview-reasoner", "preview-fast", "preview-model-with-a-very-long-name-for-mobile-layout"], "capabilities": {"preview-reasoner": {"reasoning": True}, "preview-fast": {"reasoning": False}}}, {"slug": "preview-cloud", "name": "云端预览", "authenticated": True, "models": ["preview-cloud-large", "preview-reasoner"]}, {"slug": "preview-local", "name": "本地模型", "authenticated": True, "models": ["preview-local-small"]}]})
         if path == "/api/sessions":
             offset, limit = int(query.get("offset", [0])[0]), int(query.get("limit", [200])[0])
             return self.answer(200, {"data": sessions[offset:offset+limit], "offset": offset, "limit": limit, "has_more": offset + limit < len(sessions)})
@@ -78,6 +78,9 @@ class Handler(BaseHTTPRequestHandler):
             rows = messages.get(sid, [])
             end = max(0, len(rows) - offset)
             return self.answer(200, {"data": rows[max(0, end-limit):end], "pagination": {"returned": min(limit, end)}})
+        if path.startswith("/api/sessions/") and len(path.split("/")) == 4:
+            session = next((s for s in sessions if s["id"] == path.split("/")[3]), None)
+            return self.answer(200, {"session": session}) if session else self.answer(404, {"error": "not_found"})
         if path.startswith("/v1/runs/"):
             run_id = path.split("/")[3]
             run = runs.get(run_id)
@@ -101,6 +104,20 @@ class Handler(BaseHTTPRequestHandler):
                 except (BrokenPipeError, ConnectionResetError): pass
                 return
             return self.answer(200, {"run_id": run_id, "status": run["status"]})
+        return self.answer(404, {"error": "not_found"})
+
+    def do_DELETE(self):
+        path = urlsplit(self.path).path
+        if path.startswith("/api/sessions/") and len(path.split("/")) == 4:
+            sid = path.split("/")[3]
+            with lock:
+                if any(r["session_id"] == sid and r["status"] == "running" for r in runs.values()):
+                    return self.answer(409, {"error": "session_active_turn"})
+                session = next((s for s in sessions if s["id"] == sid), None)
+                if not session: return self.answer(404, {"error": "not_found"})
+                sessions.remove(session)
+                messages.pop(sid, None)
+            return self.answer(200, {"id": sid, "deleted": True})
         return self.answer(404, {"error": "not_found"})
 
     def do_POST(self):
