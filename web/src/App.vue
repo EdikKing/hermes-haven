@@ -33,8 +33,8 @@ const turns = computed(() => groupMessages(messages.value, { text: liveText.valu
     <div v-if="sidebar" class="mobile-backdrop" @click="sidebar=false"></div>
     <aside class="sidebar" :class="{open:sidebar}">
       <div class="sidebar-brand"><div class="brand-mark"><Anchor :size="18" /></div><div><strong>Hermes Haven</strong><small>YOUR AI WORKSPACE</small></div><button class="icon-button mobile-only side-close" title="收起侧栏" @click="sidebar=false"><PanelLeftClose :size="18"/></button></div>
-      <button class="new-chat" @click="openNewSession"><Plus :size="17"/> <span>新建会话</span><kbd>＋</kbd></button>
-      <div class="search-box"><Search :size="16"/><input v-model="filter" placeholder="搜索会话" aria-label="搜索会话"><span>⌕</span></div>
+      <button class="new-chat" @click="openNewSession"><Plus :size="17"/> <span>新建会话</span></button>
+      <div class="search-box"><Search :size="14"/><input v-model="filter" placeholder="搜索会话" aria-label="搜索会话"></div>
       <div class="project-heading"><span><Folder :size="14"/> 项目分组</span><button class="icon-button" aria-label="新建分组" title="新建分组" @click="openGroupDialog()"><Plus :size="16"/></button></div>
       <div class="project-filter"><select v-model="groupFilter" aria-label="按项目分组筛选"><option value="">全部分组</option><option value="ungrouped">未分组</option><option v-for="g in groups" :key="g.id" :value="g.id">{{ g.name }}</option></select><button v-if="activeGroup" class="icon-button" aria-label="编辑当前分组" title="编辑当前分组" @click="openGroupDialog(activeGroup)"><Pencil :size="15"/></button></div>
       <div class="nav-tabs"><button :class="{active:section==='all'}" @click="section='all'">全部</button><button :class="{active:section==='mine'}" @click="section='mine'">我的会话</button><button :class="{active:section==='history'}" @click="section='history'">历史记录</button><button :class="{active:section==='archive'}" @click="section='archive'"><Archive :size="12"/> 归档</button></div>
