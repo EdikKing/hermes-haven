@@ -9,11 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"net/http"
 	"net/url"
-	"os"
-	"path/filepath"
 	"regexp"
 	"time"
 )
@@ -84,32 +80,3 @@ func (s *server) readImageReference(token, session, message string, index int) (
 }
 
 var uploadID = regexp.MustCompile(`^[a-f0-9]{40}$`)
-
-func (s *server) uploadImage(w http.ResponseWriter, r *http.Request, id string) {
-	if !uploadID.MatchString(id) {
-		fail(w, 404, "图片不可用")
-		return
-	}
-	f, err := os.Open(filepath.Join(s.dataDir, "uploads", id))
-	if err != nil {
-		fail(w, 404, "图片不可用")
-		return
-	}
-	defer f.Close()
-	st, err := f.Stat()
-	if err != nil || !st.Mode().IsRegular() || st.Size() > 5<<20 {
-		fail(w, 404, "图片不可用")
-		return
-	}
-	buf := make([]byte, 512)
-	n, _ := f.Read(buf)
-	mime := http.DetectContentType(buf[:n])
-	if mime != "image/png" && mime != "image/jpeg" && mime != "image/gif" && mime != "image/webp" {
-		fail(w, 415, "图片类型不支持")
-		return
-	}
-	_, _ = f.Seek(0, io.SeekStart)
-	w.Header().Set("Content-Type", mime)
-	w.Header().Set("X-Content-Type-Options", "nosniff")
-	_, _ = io.Copy(w, f)
-}

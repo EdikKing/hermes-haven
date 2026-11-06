@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -49,6 +48,7 @@ type server struct {
 	historyDB, historyPython, historySource, historyScript string
 	submissions                                            *submissionStore
 	submitLocks                                            sync.Map
+	artifactMu                                             sync.Mutex
 }
 
 func randomID(n int) string {
@@ -371,43 +371,11 @@ func (s *server) create(w http.ResponseWriter, r *http.Request) {
 	}
 	jsonOut(w, 201, map[string]any{"id": id, "title": "新会话"})
 }
-func (s *server) upload(w http.ResponseWriter, r *http.Request) {
-	r.Body = http.MaxBytesReader(w, r.Body, 6<<20)
-	if err := r.ParseMultipartForm(6 << 20); err != nil {
-		fail(w, 400, "图片大小不能超过 6 MB")
-		return
-	}
-	if r.MultipartForm != nil {
-		defer r.MultipartForm.RemoveAll()
-	}
-	f, h, err := r.FormFile("file")
-	if err != nil {
-		fail(w, 400, "请选择图片")
-		return
-	}
-	defer f.Close()
-	b, err := io.ReadAll(io.LimitReader(f, 5<<20+1))
-	if err != nil || len(b) > 5<<20 {
-		fail(w, 400, "图片大小不能超过 5 MB")
-		return
-	}
-	mt := http.DetectContentType(b)
-	if mt != "image/png" && mt != "image/jpeg" && mt != "image/gif" && mt != "image/webp" {
-		fail(w, 400, "仅支持 PNG、JPEG、GIF 和 WebP 图片")
-		return
-	}
-	id := randomID(20)
-	p := filepath.Join(s.dataDir, "uploads", id)
-	if err = os.WriteFile(p, b, 0600); err != nil {
-		fail(w, 500, "保存图片失败")
-		return
-	}
-	jsonOut(w, 201, map[string]any{"id": id, "name": filepath.Base(h.Filename), "mime": mt})
-}
 func (s *server) send(w http.ResponseWriter, r *http.Request, id string) {
 	var b struct {
 		Text      string   `json:"text"`
 		Images    []string `json:"images"`
+		Files     []string `json:"files"`
 		RequestID string   `json:"request_id"`
 		CreatedAt int64    `json:"created_at"`
 	}
@@ -416,38 +384,11 @@ func (s *server) send(w http.ResponseWriter, r *http.Request, id string) {
 		return
 	}
 	b.Text = strings.TrimSpace(b.Text)
-	if (b.Text == "" && len(b.Images) == 0) || len(b.Text) > 30000 || len(b.Images) > 4 || !validID(b.RequestID) {
-		fail(w, 400, "消息、图片或请求编号无效")
+	if (b.Text == "" && len(b.Images)+len(b.Files) == 0) || len(b.Text) > 30000 || len(b.Images)+len(b.Files) > 4 || !validID(b.RequestID) {
+		fail(w, 400, "消息、附件或请求编号无效")
 		return
 	}
-	var input any = b.Text
-	if len(b.Images) > 0 {
-		parts := []any{}
-		if b.Text != "" {
-			parts = append(parts, map[string]any{"type": "text", "text": b.Text})
-		}
-		total := 0
-		for _, img := range b.Images {
-			if !regexp.MustCompile(`^[a-f0-9]{40}$`).MatchString(img) {
-				fail(w, 400, "图片编号无效")
-				return
-			}
-			raw, e := os.ReadFile(filepath.Join(s.dataDir, "uploads", img))
-			if e != nil || len(raw) > 5<<20 {
-				fail(w, 400, "图片不可用")
-				return
-			}
-			total += len(raw)
-			if total > 6<<20 {
-				fail(w, 400, "图片总大小不能超过 6 MB")
-				return
-			}
-			mt := http.DetectContentType(raw)
-			parts = append(parts, map[string]any{"type": "image_url", "image_url": map[string]string{"url": "data:" + mt + ";base64," + base64.StdEncoding.EncodeToString(raw)}})
-		}
-		input = []any{map[string]any{"role": "user", "content": parts}}
-	}
-	s.submit(w, r, id, b.RequestID, b.Text, b.Images, b.CreatedAt, input)
+	s.submit(w, r, id, b.RequestID, b.Text, b.Images, b.Files, b.CreatedAt)
 }
 func (s *server) events(w http.ResponseWriter, r *http.Request, id string) {
 	own, ok := s.owned(id)
@@ -565,7 +506,14 @@ func (s *server) api(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if strings.HasPrefix(r.URL.Path, "/api/uploads/") && r.Method == "GET" {
-		s.uploadImage(w, r, strings.TrimPrefix(r.URL.Path, "/api/uploads/"))
+		p := strings.Split(strings.TrimPrefix(r.URL.Path, "/api/uploads/"), "/")
+		if len(p) == 1 {
+			s.serveAttachment(w, r, p[0], "")
+		} else if len(p) == 2 && (p[1] == "download" || p[1] == "preview") {
+			s.serveAttachment(w, r, p[0], p[1])
+		} else {
+			fail(w, 404, "未找到附件")
+		}
 		return
 	}
 	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/api/sessions/"), "/")
@@ -673,6 +621,7 @@ func (s *server) messages(w http.ResponseWriter, r *http.Request, id string) {
 		return
 	}
 	if rows, ok := v["data"].([]any); ok {
+		s.decorateAttachments(r.Context(), id, rows)
 		for _, x := range rows {
 			if m, ok := x.(map[string]any); ok {
 				m["content"] = s.scrubContent(m["content"], id, m["id"])

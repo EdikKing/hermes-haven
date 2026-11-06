@@ -17,17 +17,23 @@ import (
 )
 
 type submission struct {
-	SessionID   string          `json:"session_id"`
-	RequestID   string          `json:"request_id"`
-	Fingerprint string          `json:"fingerprint"`
-	Scope       string          `json:"scope"`
-	State       string          `json:"state"`
-	CreatedAt   time.Time       `json:"created_at"`
-	RunID       string          `json:"run_id,omitempty"`
-	Text        string          `json:"text,omitempty"`
-	Images      []string        `json:"images,omitempty"`
-	Code        int             `json:"code,omitempty"`
-	Reply       json.RawMessage `json:"reply,omitempty"`
+	Version           int             `json:"version,omitempty"`
+	SessionID         string          `json:"session_id"`
+	RequestID         string          `json:"request_id"`
+	Fingerprint       string          `json:"fingerprint"`
+	Scope             string          `json:"scope"`
+	State             string          `json:"state"`
+	CreatedAt         time.Time       `json:"created_at"`
+	RunID             string          `json:"run_id,omitempty"`
+	Text              string          `json:"text,omitempty"`
+	Images            []string        `json:"images,omitempty"`
+	Files             []string        `json:"files,omitempty"`
+	ClientFingerprint string          `json:"client_fingerprint,omitempty"`
+	FrozenInput       json.RawMessage `json:"frozen_input,omitempty"`
+	ContextNote       string          `json:"context_note,omitempty"`
+	OutputDir         string          `json:"output_dir,omitempty"`
+	Code              int             `json:"code,omitempty"`
+	Reply             json.RawMessage `json:"reply,omitempty"`
 }
 
 type submissionStore struct {
@@ -62,6 +68,18 @@ func openSubmissions(dir string) (*submissionStore, error) {
 		}
 		if rec.State != "unknown" && rec.State != "accepted" && rec.State != "rejected" && rec.State != "acknowledged" {
 			return nil, errors.New("发送记录状态无效")
+		}
+		if rec.Version != 0 && rec.Version != 2 {
+			return nil, errors.New("发送记录版本不受支持")
+		}
+		if rec.Version == 2 {
+			if !json.Valid(rec.FrozenInput) || rec.ContextNote == "" || rec.OutputDir == "" || rec.ClientFingerprint != clientFingerprint(rec.Text, rec.Images, rec.Files) {
+				return nil, errors.New("附件发送记录损坏，已停止启动")
+			}
+			raw, _ := json.Marshal(map[string]any{"session_id": rec.SessionID, "input": rec.FrozenInput})
+			if digest(string(raw)) != rec.Fingerprint {
+				return nil, errors.New("冻结的发送内容校验失败")
+			}
 		}
 		if rec.State == "accepted" && (!validID(rec.RunID) || rec.Code != 202 || !json.Valid(rec.Reply)) {
 			return nil, errors.New("运行关联记录无效")
@@ -172,19 +190,39 @@ func (s *server) canRetry(ctx context.Context, rec submission) bool {
 	return i.Supported && i.Durable && i.Retention > 60 && time.Since(rec.CreatedAt) < time.Duration(i.Retention-60)*time.Second
 }
 
-func (s *server) submit(w http.ResponseWriter, r *http.Request, id, requestID, text string, images []string, createdAt int64, input any) {
+func (s *server) submit(w http.ResponseWriter, r *http.Request, id, requestID, text string, images, files []string, createdAt int64) {
 	lock, _ := s.submitLocks.LoadOrStore(id, &sync.Mutex{})
 	mu := lock.(*sync.Mutex)
 	mu.Lock()
 	defer mu.Unlock()
-	payload := map[string]any{"session_id": id, "input": input}
-	raw, _ := json.Marshal(payload)
-	fingerprint := digest(string(raw))
 	rec, exists := s.submissions.get(id, requestID)
 	if exists && rec.State == "acknowledged" {
 		jsonOut(w, 409, map[string]any{"error": "此请求已由用户核对并关闭，不能再次执行", "code": "request_acknowledged"})
 		return
 	}
+	var input any
+	contextNote, outputDir := "", ""
+	if exists && rec.Version == 2 {
+		if rec.ClientFingerprint != clientFingerprint(text, images, files) {
+			jsonOut(w, 409, map[string]any{"error": "同一请求编号不能用于不同消息或附件", "code": "request_conflict"})
+			return
+		}
+		input = rec.FrozenInput
+	} else {
+		if exists && len(files) > 0 {
+			jsonOut(w, 409, map[string]any{"error": "原请求不包含这些附件", "code": "request_conflict"})
+			return
+		}
+		var err error
+		input, contextNote, outputDir, err = s.submissionInput(id, requestID, text, images, files, exists)
+		if err != nil {
+			fail(w, 400, err.Error())
+			return
+		}
+	}
+	payload := map[string]any{"session_id": id, "input": input}
+	raw, _ := json.Marshal(payload)
+	fingerprint := digest(string(raw))
 	if exists && rec.Fingerprint != fingerprint {
 		jsonOut(w, 409, map[string]any{"error": "同一请求编号不能用于不同消息", "code": "request_conflict"})
 		return
@@ -203,6 +241,23 @@ func (s *server) submit(w http.ResponseWriter, r *http.Request, id, requestID, t
 		jsonOut(w, 409, map[string]any{"error": "原提交结果仍未知，当前不能安全重试。请核对历史和运行状态，暂不再次执行。", "code": "retry_unsafe", "request_id": requestID})
 		return
 	}
+	if exists && rec.Version == 2 {
+		// 结果未知时仍可能首次执行；文件内容变化后不能只凭相同路径再次提交。
+		for _, fileID := range append(append([]string{}, rec.Images...), rec.Files...) {
+			a, err := s.attachment(fileID)
+			if err == nil {
+				var f *os.File
+				f, err = s.openAttachment(a)
+				if err == nil {
+					err = f.Close()
+				}
+			}
+			if err != nil {
+				jsonOut(w, 409, map[string]any{"error": "原附件缺失或内容已变化，不能安全重试，请先核对原会话历史", "code": "retry_unsafe", "request_id": requestID})
+				return
+			}
+		}
+	}
 	if !exists {
 		started := time.Now().UTC()
 		if createdAt > 0 {
@@ -219,7 +274,8 @@ func (s *server) submit(w http.ResponseWriter, r *http.Request, id, requestID, t
 				started = clientTime
 			}
 		}
-		rec = submission{SessionID: id, RequestID: requestID, Fingerprint: fingerprint, Scope: digest(s.hermesURL + "\n" + s.apiKey), State: "unknown", CreatedAt: started, Text: text, Images: images}
+		frozen, _ := json.Marshal(input)
+		rec = submission{Version: 2, SessionID: id, RequestID: requestID, Fingerprint: fingerprint, Scope: digest(s.hermesURL + "\n" + s.apiKey), State: "unknown", CreatedAt: started, Text: text, Images: images, Files: files, ClientFingerprint: clientFingerprint(text, images, files), FrozenInput: frozen, ContextNote: contextNote, OutputDir: outputDir}
 		if err := s.submissions.save(rec); err != nil {
 			fail(w, 503, "无法保存发送记录，本次未提交给 Hermes")
 			return
@@ -260,8 +316,10 @@ func (s *server) submit(w http.ResponseWriter, r *http.Request, id, requestID, t
 		}
 		rec.State = "accepted"
 		rec.RunID = run
-		rec.Text = ""
-		rec.Images = nil
+		if rec.Version == 0 {
+			rec.Text = ""
+			rec.Images = nil
+		}
 	} else {
 		// 已经未知的请求不能因后续认证或配置变化而被认定为未执行。
 		if exists {
@@ -312,6 +370,7 @@ func (s *server) requestStatus(w http.ResponseWriter, r *http.Request, id, reque
 	if rec.State == "unknown" {
 		v["text"] = rec.Text
 		v["images"] = rec.Images
+		v["files"] = rec.Files
 	}
 	if rec.State == "rejected" {
 		var reply any
@@ -365,7 +424,7 @@ func (s *server) sessionRun(id string) string {
 }
 func (s *server) sessionStatus(w http.ResponseWriter, r *http.Request, id string) {
 	if rec, ok := s.submissions.latest(id, true); ok {
-		jsonOut(w, 200, map[string]any{"status": "submission_unknown", "request_id": rec.RequestID, "text": rec.Text, "images": rec.Images, "created_at": rec.CreatedAt})
+		jsonOut(w, 200, map[string]any{"status": "submission_unknown", "request_id": rec.RequestID, "text": rec.Text, "images": rec.Images, "files": rec.Files, "created_at": rec.CreatedAt})
 		return
 	}
 	run := s.sessionRun(id)
