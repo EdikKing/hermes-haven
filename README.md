@@ -57,6 +57,8 @@ Haven 将用户输入的账号密码通过 Dashboard 的 `/auth/password-login` 
 - `/opt/hermes-haven/hermes-haven`
 - `/var/lib/hermes-haven/`
 
+2026-11-06 已上线清爽配色 UI，部署校验和备份位置见 [第一阶段验收记录](docs/第一阶段验收.md)。
+
 使用现有 Hermes Dashboard 账号登录，身份由本机 `127.0.0.1:9119` 的 Hermes 服务验证。此前生成的独立密码文件不再使用。该服务以 root 运行，沿用当前 Hermes 的文件访问权限。
 
 ```shell
