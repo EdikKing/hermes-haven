@@ -41,6 +41,9 @@ go build -o hermes-haven .
 | `HERMES_URL` | Hermes 官方 API 地址 | `http://127.0.0.1:8642` |
 | `HERMES_ENV_FILE` | 从 Hermes `.env` 读取 `API_SERVER_KEY` | 无 |
 | `HERMES_API_KEY` | 直接提供 API Key；优先于 `HERMES_ENV_FILE` | 无 |
+| `HERMES_HISTORY_DB` | Hermes 当前 profile 的数据库；以只读方式展示完整历史 | 无 |
+| `HERMES_HISTORY_PYTHON` | 已安装 Hermes 的 Python 解释器 | `python3` |
+| `HERMES_SOURCE_DIR` | 已安装 Hermes 的源码目录 | `/usr/local/lib/hermes-agent` |
 | `HAVEN_IMAGE_ROOTS` | 允许读取历史图片的目录，按操作系统路径列表分隔 | `/root/.hermes-web-ui/upload:/root/.hermes/cache/documents/native-inputs` |
 | `HAVEN_SECURE_COOKIE` | HTTPS 反向代理下设为 `true` | `false` |
 
@@ -52,7 +55,7 @@ Haven 将用户输入的账号密码通过 Dashboard 的 `/auth/password-login` 
 
 ## 当前服务器部署
 
-当前部署在 `10.1.1.52`，访问地址为 `http://10.1.1.52:18770/`。服务名是 `hermes-haven.service`，已配置开机启动；二进制文件和 Haven 数据分别位于：
+当前部署在 `10.1.1.52`，已按 Hermes 0.23.0 完成兼容复验，访问地址为 `http://10.1.1.52:18770/`。服务名是 `hermes-haven.service`，已配置开机启动；二进制文件和 Haven 数据分别位于：
 
 - `/opt/hermes-haven/hermes-haven`
 - `/var/lib/hermes-haven/`
@@ -75,6 +78,10 @@ Haven 不调用 Hermes 的会话删除、消息修改、历史截断或历史分
 历史图片仅在消息本身引用、文件位于允许目录且解析后的路径没有越界时读取。支持的上传图片格式为 PNG、JPEG、GIF、WebP：单张不超过 5 MB，每次最多四张且总大小不超过 6 MB。
 
 历史图片的新链接由实际读取的消息签发加密引用，绑定会话、消息和图片位置，仍需登录并检查允许目录；不再为了展示图片扫描整条历史。旧链接继续按页兼容读取，不设置 3,000 条消息的扫描上限。
+
+完整历史使用 Hermes 自带的 `SessionDB(read_only=True)`，并启用 SQLite 连接的 `query_only`，避免官方完整消息 HTTP 接口对旧记录的显示索引自动回填。读取脚本随二进制内置，保存到 Haven 自己的数据目录；子进程禁止惰性安装和字节码写入。当前服务器配置数据库 `/root/.hermes/state.db`、解释器 `/usr/local/lib/hermes-agent/venv/bin/python`。不修改 Hermes 的代码或配置。
+
+配置只读数据库后，服务启动时会先检查读取能力，失败时不回退到可能写入旧索引的完整历史接口。未配置只读数据库时，HTTP 路径只取活动消息，并在旧会话页面提示完整历史暂未启用。
 
 ## 恢复与重试
 

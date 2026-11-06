@@ -144,6 +144,12 @@ func newServer() (*server, error) {
 			s.imageRoots = append(s.imageRoots, root)
 		}
 	}
+	if s.historyDB != "" {
+		_, code, probeErr := s.readOnlyMessages(context.Background(), "__haven_history_probe__", "0")
+		if probeErr != nil || code != 404 {
+			return nil, errors.New("无法确认 Hermes 只读历史能力，请检查历史读取配置")
+		}
+	}
 	return s, nil
 }
 func (s *server) saveLocked() error {
@@ -637,12 +643,7 @@ func (s *server) fetchMessages(ctx context.Context, id, offset string) (map[stri
 	return v, res.StatusCode, err
 }
 func (s *server) scrubContent(content any, id string, mid any) any {
-	text, ok := content.(string)
-	if !ok {
-		return content
-	}
-	var blocks []map[string]any
-	if json.Unmarshal([]byte(text), &blocks) == nil && len(blocks) > 0 {
+	if blocks, ok := contentBlocks(content); ok {
 		for i, b := range blocks {
 			if b["type"] == "image" {
 				path, _ := b["path"].(string)
@@ -652,6 +653,10 @@ func (s *server) scrubContent(content any, id string, mid any) any {
 			}
 		}
 		return blocks
+	}
+	text, ok := content.(string)
+	if !ok {
+		return content
 	}
 	n := 0
 	return imageMarker.ReplaceAllStringFunc(text, func(marker string) string {
@@ -713,8 +718,7 @@ func (s *server) historyImage(w http.ResponseWriter, r *http.Request, id, mid, i
 				continue
 			}
 			text, _ := m["content"].(string)
-			var blocks []map[string]any
-			if json.Unmarshal([]byte(text), &blocks) == nil && i < len(blocks) {
+			if blocks, ok := contentBlocks(m["content"]); ok && i < len(blocks) {
 				path, _ = blocks[i]["path"].(string)
 			} else {
 				matches := imageMarker.FindAllStringSubmatch(text, -1)

@@ -26,6 +26,29 @@ type imageRef struct {
 	Expires int64  `json:"e"`
 }
 
+func contentBlocks(content any) ([]map[string]any, bool) {
+	var blocks []map[string]any
+	switch value := content.(type) {
+	case string:
+		if json.Unmarshal([]byte(value), &blocks) != nil {
+			return nil, false
+		}
+	case []map[string]any:
+		blocks = value
+	case []any:
+		for _, item := range value {
+			block, ok := item.(map[string]any)
+			if !ok {
+				return nil, false
+			}
+			blocks = append(blocks, block)
+		}
+	default:
+		return nil, false
+	}
+	return blocks, len(blocks) > 0
+}
+
 func (s *server) imageCipher() cipher.AEAD {
 	key := sha256.Sum256([]byte("hermes-haven-history-image-v1\n" + s.apiKey))
 	block, _ := aes.NewCipher(key[:])
