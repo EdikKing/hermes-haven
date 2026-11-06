@@ -9,12 +9,20 @@ from urllib.parse import parse_qs, urlsplit
 
 lock = threading.RLock()
 sessions = [
+    {"id": "preview_tools", "source": "cli", "title": "工具调用紧凑预览", "last_active": 1793956307},
     {"id": "preview_cli", "source": "cli", "title": "周末出行计划", "last_active": 1793926000},
     {"id": "preview_weixin", "source": "weixin", "title": "整理阅读清单", "last_active": 1793816000},
 ] + [{"id": f"preview_old_{i}", "source": "cli", "title": f"历史测试 {i}", "last_active": 1700000000 - i} for i in range(2400)] + [
     {"id": "preview_ancient", "source": "weixin", "title": "最早历史分页验收", "last_active": 1600000000}
 ]
 messages = {"preview_cli": [{"id": i + 1, "role": "user" if i % 2 == 0 else "assistant", "content": f"长历史消息 {i + 1}", "timestamp": 1793926000 + i} for i in range(3105)]}
+messages["preview_tools"] = [{"id": 1, "role": "user", "content": "帮我整理这篇笔记，检查内容后给出摘要。", "timestamp": 1793956307}]
+for index, names in enumerate((("read_file", "terminal"), ("tool_call", "terminal"), ("write_file",), ("mcp__ekko_studio_interaction__ekko_studio_update_plan",))):
+    calls = [{"id": f"preview_call_{index}_{number}", "function": {"name": name, "arguments": json.dumps({"path": "notes/example.md"})}} for number, name in enumerate(names)]
+    messages["preview_tools"].append({"id": len(messages["preview_tools"]) + 1, "role": "assistant", "content": "", "tool_calls": calls, "timestamp": 1793956308 + index})
+    for call in reversed(calls):
+        messages["preview_tools"].append({"id": len(messages["preview_tools"]) + 1, "role": "tool", "tool_call_id": call["id"], "tool_name": call["function"]["name"], "content": "执行成功，笔记内容已核对。", "timestamp": 1793956308 + index})
+messages["preview_tools"].append({"id": len(messages["preview_tools"]) + 1, "role": "assistant", "content": "笔记已整理完成。\n\n### 内容摘要\n\n工具调用、文件检查和整理结果现在集中展示，展开上方工具区即可查看每一步的参数与结果。", "timestamp": 1793956312})
 if os.environ.get("MOCK_IMAGE_PATH"):
     messages["preview_cli"][2]["content"] = "[Image attached at: " + os.environ["MOCK_IMAGE_PATH"] + "]"
 runs, reservations = {}, {}

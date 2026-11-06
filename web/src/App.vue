@@ -1,7 +1,11 @@
 <script setup>
-import { Anchor, ArrowUp, Check, ChevronDown, ChevronRight, CircleAlert, Clock3, ImagePlus, LoaderCircle, LockKeyhole, LogOut, Menu, MessageSquare, MoreHorizontal, PanelLeftClose, Pencil, Plus, Search, Square, Sparkles, Terminal, UserRound, Wrench, X } from 'lucide-vue-next'
+import { computed } from 'vue'
+import { Anchor, ArrowUp, Check, ChevronDown, ChevronRight, CircleAlert, Clock3, ImagePlus, LoaderCircle, LockKeyhole, LogOut, Menu, MessageSquare, MoreHorizontal, PanelLeftClose, Pencil, Plus, Search, Square, Sparkles, UserRound, X } from 'lucide-vue-next'
 import { useHaven } from './useHaven.js'
-const { logged, username, password, identity, loginError, signingIn, filter, section, selected, messages, loading, sidebar, editing, titleDraft, hasOlder, scroller, picker, health, sessionsLoading, hasMoreSessions, searching, olderLoading, globalNotice, text, files, pending, status, tools, liveText, sending, uploading, isBusy, isUncertain, composerLocked, mine, notice, filtered, selectedTitle, statusLabel, sourceName, sessionTitle, timeLabel, login, logout, checkHealth, loadMoreSessions, choose, moreHistory, createSession, startRename, rename, attach, pasteImages, removeImage, send, retryPending, acknowledgePending, refreshStatus, stop, messageText, imageBlocks, calls, callName, callArgs, roleLabel, render } = useHaven()
+import { groupMessages, imageBlocks, messageText } from './messages.js'
+import ToolGroup from './ToolGroup.vue'
+const { logged, username, password, identity, loginError, signingIn, filter, section, selected, messages, loading, sidebar, editing, titleDraft, hasOlder, scroller, picker, health, sessionsLoading, hasMoreSessions, searching, olderLoading, globalNotice, text, files, pending, tools, liveText, sending, uploading, isBusy, isUncertain, composerLocked, mine, notice, filtered, selectedTitle, statusLabel, sourceName, sessionTitle, timeLabel, login, logout, checkHealth, loadMoreSessions, choose, moreHistory, createSession, startRename, rename, attach, pasteImages, removeImage, send, retryPending, acknowledgePending, refreshStatus, stop, render } = useHaven()
+const turns = computed(() => groupMessages(messages.value, { text: liveText.value, tools: tools.value, busy: isBusy.value }))
 </script>
 <template>
   <div v-if="logged === null" class="splash"><LoaderCircle class="spin" :size="22" /></div>
@@ -26,8 +30,20 @@ const { logged, username, password, identity, loginError, signingIn, filter, sec
         <div v-else class="thread"><div class="thread-intro"><div class="thread-kicker"><span class="mini-mark"><Anchor :size="12"/></span> {{ mine?'HERMES HAVEN':'历史记录' }} <span class="intro-divider">/</span> {{ sourceName(selected.source) }}</div><div v-if="editing" class="rename"><input v-model="titleDraft" maxlength="80" @keydown.enter="rename" @keydown.esc="editing=false"><button class="icon-button" @click="rename"><Check :size="16"/></button><button class="icon-button" @click="editing=false"><X :size="16"/></button></div><h2 v-else>{{ selectedTitle }}</h2><p>{{ mine?'一个属于你的思考空间':'这条会话来自其他入口，可尝试继续对话。' }}</p></div>
           <button v-if="hasOlder" class="older" :disabled="olderLoading||loading" @click="moreHistory"><Clock3 :size="14"/> {{ olderLoading?'正在加载…':'加载更早的消息' }}</button>
           <div v-if="loading" class="thread-loading"><LoaderCircle class="spin" :size="18"/> 正在加载会话…</div>
-          <template v-for="(m,i) in messages" :key="m.id || i"><div v-if="m.role==='user'||m.role==='assistant'" class="message" :class="m.role"><div class="message-avatar" :class="m.role">{{ m.role==='user'?'你':'H' }}</div><div class="message-body"><div class="message-meta"><strong>{{ roleLabel(m) }}</strong><span>{{ timeLabel(m.timestamp) }}</span></div><div v-if="messageText(m)" class="prose" v-html="render(messageText(m))"></div><div v-if="imageBlocks(m).length" class="message-images"><img v-for="img in imageBlocks(m)" :key="img.src" :src="img.src" :alt="img.name||'图片'"></div><details v-for="(call,k) in calls(m)" :key="k" class="tool-card"><summary><Wrench :size="14"/><span>{{ callName(call) }}</span><ChevronDown :size="14"/></summary><pre>{{ callArgs(call) }}</pre></details></div></div><details v-else-if="m.role==='tool'" class="historical-tool"><summary><Terminal :size="14"/> {{ m.tool_name || '工具结果' }} <ChevronDown :size="14"/></summary><pre>{{ messageText(m) }}</pre></details></template>
-          <div v-if="isBusy || liveText || tools.length" class="message assistant"><div class="message-avatar assistant">H</div><div class="message-body"><div class="message-meta"><strong>Hermes</strong><span class="live-label"><span class="status-dot" :class="isBusy?'online':''"></span> {{ statusLabel }}</span></div><div v-if="liveText" class="prose" v-html="render(liveText)"></div><details v-for="t in tools" :key="t.id" class="tool-card" :class="{'tool-error':t.state==='error'}" :open="t.state==='error'"><summary><Wrench :size="14"/><span>{{ t.name }}</span><small>{{ t.state==='running'?'执行中':t.state==='error'?'失败':'已完成' }}{{ t.duration!=null?' · '+t.duration+' 秒':'' }}</small><LoaderCircle v-if="t.state==='running'" class="spin" :size="14"/><Check v-else-if="t.state==='done'" :size="14"/><CircleAlert v-else :size="14"/></summary><div v-if="t.preview" class="tool-preview">{{ t.preview }}</div><pre v-if="t.error||t.result">{{ t.error||t.result }}</pre><div v-if="t.result" class="tool-preview">实时结果摘要，完整记录以保存的历史为准</div></details><div v-if="isBusy&&!liveText&&!tools.length" class="thinking"><span></span><span></span><span></span></div></div></div>
+          <div v-for="turn in turns" :key="turn.key" class="message" :class="turn.role">
+            <div class="message-avatar" :class="turn.role">{{ turn.role==='user'?'你':'H' }}</div>
+            <div class="message-body">
+              <div class="message-meta"><strong>{{ turn.role==='user'?'你':'Hermes' }}</strong><span v-if="turn.timestamp">{{ timeLabel(turn.timestamp) }}</span><span v-if="turn.live" class="live-label"><span class="status-dot" :class="isBusy?'online':''"></span> {{ statusLabel }}</span></div>
+              <div v-for="block in turn.blocks" :key="block.key" class="message-block">
+                <template v-if="block.type==='content'">
+                  <div v-if="messageText(block.message)" class="prose" v-html="render(messageText(block.message))"></div>
+                  <div v-if="imageBlocks(block.message).length" class="message-images"><img v-for="img in imageBlocks(block.message)" :key="img.src" :src="img.src" :alt="img.name||'图片'"></div>
+                </template>
+                <ToolGroup v-else-if="block.type==='tools'" :tools="block.tools" :live="block.live"/>
+                <div v-else-if="block.type==='thinking'" class="thinking"><span></span><span></span><span></span></div>
+              </div>
+            </div>
+          </div>
           <div v-if="!loading&&!messages.length&&!isBusy" class="empty-thread"><Sparkles :size="19"/><span>一段新的对话，从这里开始。</span></div>
         </div>
       </div>

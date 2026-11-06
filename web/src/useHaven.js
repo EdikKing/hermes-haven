@@ -336,18 +336,11 @@ export function useHaven() {
   }
   function beforeUnload() { if (selected.value) saveCheckpoint(selected.value.id); savePreferences() }
 
-  function messageText(message) { if (Array.isArray(message.content)) return message.content.filter(x => x.type === 'text').map(x => x.text).join('\n'); return typeof message.content === 'string' ? message.content : '' }
-  function imageBlocks(message) { return Array.isArray(message.content) ? message.content.filter(x => x.type === 'image' && x.src) : [] }
-  function calls(message) { if (!message.tool_calls) return []; if (Array.isArray(message.tool_calls)) return message.tool_calls; try { return JSON.parse(message.tool_calls) || [] } catch { return [] } }
-  function callName(call) { return call.function?.name || call.name || '工具' }
-  function callArgs(call) { const value = call.function?.arguments || call.arguments || ''; try { return JSON.stringify(typeof value === 'string' ? JSON.parse(value) : value, null, 2) } catch { return String(value) } }
-  function roleLabel(message) { return message.role === 'user' ? '你' : message.role === 'assistant' ? 'Hermes' : message.tool_name || '工具' }
-
   onMounted(async () => {
     window.addEventListener('online', online); window.addEventListener('offline', offline); window.addEventListener('storage', storageChanged); window.addEventListener('pagehide', beforeUnload)
     try { identity.value = await api('/api/me'); logged.value = true; await initialize() } catch (e) { logged.value = false; if (e.network) loginError.value = '无法连接服务器，请恢复网络后重试。' }
   })
   onUnmounted(() => { beforeUnload(); closeStream(); clearTimeout(searchTimer); window.removeEventListener('online', online); window.removeEventListener('offline', offline); window.removeEventListener('storage', storageChanged); window.removeEventListener('pagehide', beforeUnload) })
 
-  return { logged, username, password, identity, loginError, signingIn, sessions, filter, section, selected, messages, loading, sidebar, editing, titleDraft, hasOlder, scroller, picker, health, sessionsLoading, hasMoreSessions, searching, olderLoading, globalNotice, text, files, pending, status, tools, liveText, sending, uploading, isBusy, isUncertain, composerLocked, mine, notice, filtered, selectedTitle, statusLabel, sourceName, sessionTitle, timeLabel, login, logout, checkHealth, loadMoreSessions, choose, moreHistory, createSession, startRename, rename, attach, pasteImages, removeImage, send, retryPending, acknowledgePending, refreshStatus, stop, messageText, imageBlocks, calls, callName, callArgs, roleLabel, render }
+  return { logged, username, password, identity, loginError, signingIn, sessions, filter, section, selected, messages, loading, sidebar, editing, titleDraft, hasOlder, scroller, picker, health, sessionsLoading, hasMoreSessions, searching, olderLoading, globalNotice, text, files, pending, status, tools, liveText, sending, uploading, isBusy, isUncertain, composerLocked, mine, notice, filtered, selectedTitle, statusLabel, sourceName, sessionTitle, timeLabel, login, logout, checkHealth, loadMoreSessions, choose, moreHistory, createSession, startRename, rename, attach, pasteImages, removeImage, send, retryPending, acknowledgePending, refreshStatus, stop, render }
 }
