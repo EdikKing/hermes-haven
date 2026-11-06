@@ -15,7 +15,7 @@ async function until(predicate) {
 function backend() {
   const server = {
     rows: [{ id: 'one', owned: true, title: '项目讨论', group_id: '', archived: false }, { id: 'old', owned: false, source: 'cli', title: '历史讨论', group_id: '', archived: false }],
-    groups: [], calls: [], deleteFailure: false, deletionGate: null, pages: null,
+    groups: [], calls: [], deleteFailure: false, deletionGate: null, pages: null, pageFailure: null, pageHook: null,
     async fetch(input, init = {}) {
       const url = new URL(input, 'http://haven.test'), path = url.pathname, method = init.method || 'GET'
       server.calls.push(method + ' ' + path + url.search)
@@ -25,6 +25,8 @@ function backend() {
       if (path === '/api/models') return reply({ providers: [] })
       if (path === '/api/sessions') {
         const offset = Number(url.searchParams.get('offset') || 0)
+        await server.pageHook?.(offset)
+        if (offset === server.pageFailure) return reply({ error: '会话列表暂不可用' }, 503)
         const page = server.pages?.[offset] || { data: server.rows, has_more: false }
         return reply({ ...page, offset, limit: 200, groups: server.groups })
       }
@@ -125,6 +127,157 @@ test('归档和分组查找继续跨过全部为已删除记录的空分页', as
     await until(() => h.filtered.value.length === 1 && !h.searching.value)
     assert.equal(h.filtered.value[0].id, 'old'); assert.ok(server.calls.includes('GET /api/sessions?offset=400')); assert.equal(h.hasMoreSessions.value, false)
   } finally { c.dispose() }
+})
+
+test('我的会话只有两条时，其他来源的后续分页不显示加载更多', async () => {
+  const server = backend(), mine = [server.rows[0], { ...server.rows[0], id: 'two' }]
+  const history = Array.from({ length: 398 }, (_, i) => ({ id: 'history_' + i, owned: false }))
+  server.pages = {
+    0: { data: [...mine, ...history.slice(0, 198)], has_more: true },
+    200: { data: history.slice(198), has_more: true },
+    400: { data: [{ id: 'last_history', owned: false }], has_more: false },
+  }
+  const c = await mount(server), h = c.h
+  try {
+    h.section.value = 'mine'
+    await until(() => server.calls.includes('GET /api/sessions?offset=400') && !h.searching.value && !h.sessionsLoading.value)
+    assert.deepEqual(h.filtered.value.map(s => s.id), ['one', 'two'])
+    assert.equal(h.hasMoreSessions.value, false)
+  } finally { c.dispose() }
+})
+
+test('加载更多只在后续页面存在匹配会话时显示，跨过空页并在末页停止', async () => {
+  const server = backend(), mine = Array.from({ length: 200 }, (_, i) => ({ id: 'mine_' + i, owned: true }))
+  server.pages = {
+    0: { data: mine, has_more: true },
+    200: { data: [], has_more: true },
+    400: { data: [{ id: 'other_history', owned: false }], has_more: true },
+    600: { data: [{ id: 'last_mine', owned: true }], has_more: true },
+    800: { data: [{ id: 'last_history', owned: false }], has_more: false },
+  }
+  const c = await mount(server), h = c.h
+  try {
+    h.section.value = 'mine'
+    await until(() => server.calls.includes('GET /api/sessions?offset=600') && !h.searching.value)
+    assert.equal(h.filtered.value.length, 200)
+    assert.equal(h.hasMoreSessions.value, true)
+    assert.equal(server.calls.includes('GET /api/sessions?offset=800'), false)
+    await h.loadMoreSessions()
+    assert.equal(h.filtered.value.length, 201)
+    assert.equal(h.filtered.value.at(-1).id, 'last_mine')
+    assert.equal(h.hasMoreSessions.value, false)
+    const count = server.calls.length
+    await h.loadMoreSessions()
+    assert.equal(server.calls.length, count)
+  } finally { c.dispose() }
+})
+
+test('全部列表恰好一页且后续只有归档会话时不显示加载更多', async () => {
+  const server = backend(), rows = Array.from({ length: 200 }, (_, i) => ({ id: 'visible_' + i, owned: true }))
+  server.pages = { 0: { data: rows, has_more: true }, 200: { data: [{ id: 'archived', archived: true }], has_more: false } }
+  const c = await mount(server), h = c.h
+  try {
+    await until(() => server.calls.includes('GET /api/sessions?offset=200') && !h.searching.value && !h.sessionsLoading.value)
+    assert.equal(h.filtered.value.length, 200)
+    assert.equal(h.hasMoreSessions.value, false)
+    h.section.value = 'archive'
+    assert.deepEqual(h.filtered.value.map(s => s.id), ['archived'])
+    assert.equal(h.hasMoreSessions.value, false)
+  } finally { c.dispose() }
+})
+
+test('分组、归档、历史和标题搜索分别按匹配结果判断是否还有下一页', async t => {
+  const cases = [
+    { name: '分组', setup: h => { h.groupFilter.value = 'project' }, row: { owned: true, group_id: 'project' } },
+    { name: '未分组', setup: h => { h.groupFilter.value = 'ungrouped' }, row: { owned: true }, other: { group_id: 'project' } },
+    { name: '归档', setup: h => { h.section.value = 'archive' }, row: { archived: true } },
+    { name: '历史', setup: h => { h.section.value = 'history' }, row: { owned: false }, other: { owned: true } },
+    { name: '搜索', setup: h => { h.filter.value = '目标' }, row: { title: '目标会话' } },
+  ]
+  for (const item of cases) await t.test(item.name, async () => {
+    const server = backend(), matching = Array.from({ length: 201 }, (_, i) => ({ id: 'match_' + i, owned: true, ...item.row }))
+    server.groups = [{ id: 'project', name: '项目' }]
+    server.pages = {
+      0: { data: matching.slice(0, 200), has_more: true },
+      200: { data: [{ id: 'unmatched', owned: true, title: '其他会话', ...item.other }], has_more: true },
+      400: { data: matching.slice(200), has_more: false },
+    }
+    const c = await mount(server), h = c.h
+    try {
+      item.setup(h)
+      await until(() => server.calls.includes('GET /api/sessions?offset=400') && !h.searching.value && !h.sessionsLoading.value)
+      assert.equal(h.filtered.value.length, 200)
+      assert.equal(h.hasMoreSessions.value, true)
+      await h.loadMoreSessions()
+      assert.equal(h.filtered.value.length, 201)
+      assert.ok(h.filtered.value.every(s => s.id.startsWith('match_')))
+      assert.equal(h.hasMoreSessions.value, false)
+    } finally { c.dispose() }
+  })
+})
+
+test('后续分页读取失败时提供重试，恢复后按实际剩余会话更新按钮', async () => {
+  const server = backend()
+  server.pages = { 0: { data: [server.rows[0]], has_more: true }, 200: { data: [server.rows[1]], has_more: false } }
+  server.pageFailure = 200
+  const c = await mount(server), h = c.h
+  try {
+    h.section.value = 'mine'
+    await until(() => h.sessionsError?.value && !h.searching.value && !h.sessionsLoading.value)
+    assert.equal(h.hasMoreSessions.value, false)
+    assert.match(h.sessionsError.value, /暂不可用/)
+    server.pageFailure = null
+    await h.loadMoreSessions()
+    assert.equal(h.sessionsError.value, '')
+    assert.equal(h.hasMoreSessions.value, false)
+    assert.deepEqual(h.filtered.value.map(s => s.id), ['one'])
+  } finally { c.dispose() }
+})
+
+test('切换筛选时正在读取的分页继续缓存，但不会沿旧筛选重复请求', async () => {
+  const server = backend(), mine = Array.from({ length: 200 }, (_, i) => ({ id: 'mine_' + i, owned: true }))
+  server.pages = {
+    0: { data: mine, has_more: true },
+    200: { data: [{ id: 'history_one', owned: false }], has_more: true },
+    400: { data: [{ id: 'history_two', owned: false }], has_more: true },
+    600: { data: [], has_more: false },
+  }
+  const c = await mount(server), h = c.h
+  let release
+  const gate = new Promise(resolve => { release = resolve })
+  server.pageHook = offset => offset === 400 ? gate : null
+  try {
+    h.section.value = 'mine'
+    await until(() => server.calls.includes('GET /api/sessions?offset=400'))
+    h.section.value = 'history'
+    await new Promise(resolve => setTimeout(resolve, 380))
+    release()
+    await until(() => server.calls.includes('GET /api/sessions?offset=600') && !h.searching.value && !h.sessionsLoading.value)
+    assert.deepEqual(h.filtered.value.map(s => s.id), ['history_one', 'history_two'])
+    assert.equal(h.hasMoreSessions.value, false)
+    assert.equal(server.calls.filter(call => call === 'GET /api/sessions?offset=400').length, 1)
+  } finally { release(); c.dispose() }
+})
+
+test('离开页面后停止分页探查，迟到响应不会继续请求或写回列表', async () => {
+  const server = backend(), mine = Array.from({ length: 200 }, (_, i) => ({ id: 'mine_' + i, owned: true }))
+  server.pages = {
+    0: { data: mine, has_more: true },
+    200: { data: [{ id: 'history_one', owned: false }], has_more: true },
+    400: { data: [{ id: 'late_history', owned: false }], has_more: true },
+  }
+  const c = await mount(server), h = c.h
+  let release
+  const gate = new Promise(resolve => { release = resolve })
+  server.pageHook = offset => offset === 400 ? gate : null
+  h.section.value = 'mine'
+  try { await until(() => server.calls.includes('GET /api/sessions?offset=400')) }
+  finally { c.dispose(); release() }
+  const count = server.calls.length
+  await new Promise(resolve => setTimeout(resolve, 50))
+  assert.equal(server.calls.length, count)
+  assert.equal(h.sessions.value.some(s => s.id === 'late_history'), false)
+  assert.equal(h.searching.value, false)
 })
 
 test('另一个标签页完成删除后清空当前会话，旧缓存不能在离开页面时重新写回', async () => {

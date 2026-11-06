@@ -18,8 +18,10 @@ export function useHaven() {
   const sessions = ref([]), filter = ref(''), section = ref('mine'), selected = ref(null), messages = ref([]), loading = ref(false)
   const groups = ref([]), groupFilter = ref(''), sessionAction = ref(null), groupDialog = ref(null), organizationBusy = ref(false), organizationError = ref('')
   const removedSessions = new Set()
-  const sidebar = ref(false), editing = ref(false), titleDraft = ref(''), hasOlder = ref(false), scroller = ref(null), picker = ref(null)
-  const health = ref('connecting'), sessionsLoading = ref(false), hasMoreSessions = ref(false), searching = ref(false), olderLoading = ref(false), globalNotice = ref('')
+  const sidebar = ref(false), editing = ref(false), titleDraft = ref(''), hasOlder = ref(false), scroller = ref(null), sessionList = ref(null), picker = ref(null)
+  const health = ref('connecting'), sessionsLoading = ref(false), sessionsError = ref(''), searching = ref(false), olderLoading = ref(false), globalNotice = ref('')
+  const sessionPageSize = 200, sessionLimit = ref(sessionPageSize)
+  let moreSessionPages = false
   const olderError = ref('')
   const drafts = reactive({}), runs = reactive({}), sendingIDs = reactive(new Set()), uploadingIDs = reactive({})
   const previewFile = ref(null)
@@ -77,11 +79,13 @@ export function useHaven() {
   const contextError = computed(() => selected.value ? contextErrors[selected.value.id] || '' : '')
   const mine = computed(() => selected.value?.owned === true)
   const notice = computed({ get: () => currentView.value.notice || globalNotice.value, set: value => { if (selected.value) { globalNotice.value = ''; view(selected.value.id).notice = value } else globalNotice.value = value } })
-  const filtered = computed(() => sessions.value.filter(s =>
+  const matchingSessions = computed(() => sessions.value.filter(s =>
     (section.value === 'archive' ? s.archived : !s.archived) &&
     (section.value !== 'mine' || s.owned) && (section.value !== 'history' || !s.owned) &&
     (!groupFilter.value || (groupFilter.value === 'ungrouped' ? !s.group_id : s.group_id === groupFilter.value)) &&
     sessionTitle(s).toLowerCase().includes(filter.value.trim().toLowerCase())))
+  const filtered = computed(() => matchingSessions.value.slice(0, sessionLimit.value))
+  const hasMoreSessions = computed(() => matchingSessions.value.length > sessionLimit.value)
   const selectedGroup = computed(() => groups.value.find(g => g.id === selected.value?.group_id)?.name || '')
   const actionBlocked = computed(() => {
     const row = sessionAction.value
@@ -106,6 +110,7 @@ export function useHaven() {
   }
   function saveCheckpoint(id) { workspace?.saveCheckpoint(id, view(id)) }
   function expireLogin() {
+    invalidateSessionList()
     resetHistoryLoading()
     stopContextRefresh()
     previewFile.value = null
@@ -142,7 +147,7 @@ export function useHaven() {
     try { await api('/api/logout', { method: 'POST', body: '{}' }) } catch (e) { if (e.status !== 401) { notice.value = '退出未完成，请恢复连接后重试。'; return } }
     savePreferences(); if (selected.value) saveCheckpoint(selected.value.id)
     resetHistoryLoading()
-    stopContextRefresh(); closeStream(); selectionEpoch++; listEpoch++; logged.value = false; selected.value = null; messages.value = []; password.value = ''; previewFile.value = null; newSessionOpen.value = false; sessionAction.value = null; groupDialog.value = null
+    stopContextRefresh(); closeStream(); selectionEpoch++; invalidateSessionList(); logged.value = false; selected.value = null; messages.value = []; password.value = ''; previewFile.value = null; newSessionOpen.value = false; sessionAction.value = null; groupDialog.value = null
   }
   async function initialize() {
     resetHistoryLoading()
@@ -168,7 +173,7 @@ export function useHaven() {
     await Promise.all([loadSessions(), checkHealth()])
     if (!logged.value) return
     groupFilter.value = prefs.groupFilter === 'ungrouped' || groups.value.some(g => g.id === prefs.groupFilter) ? prefs.groupFilter : ''
-    scanSessions()
+    resumeSessionScan()
     if (prefs.selected?.id && !isRemoved(prefs.selected.id) && /^[A-Za-z0-9_-]{1,160}$/.test(prefs.selected.id)) {
       const restored = sessions.value.find(s => s.id === prefs.selected.id) || prefs.selected
       await choose(restored)
@@ -228,8 +233,9 @@ export function useHaven() {
   async function loadSessions(more = false) {
     if (sessionsLoading.value && more) return
     const epoch = more ? listEpoch : ++listEpoch
-    if (!more) { sessionOffset = 0; hasMoreSessions.value = false }
-    sessionsLoading.value = true
+    if (!more) { clearTimeout(searchTimer); searchEpoch++; searching.value = false; sessionOffset = 0; moreSessionPages = false; sessionLimit.value = sessionPageSize }
+    sessionsLoading.value = true; sessionsError.value = ''
+    let loaded = false
     try {
       const data = await api('/api/sessions?offset=' + (more ? sessionOffset : 0))
       if (epoch !== listEpoch || !logged.value) return
@@ -237,27 +243,55 @@ export function useHaven() {
       for (const row of rows) { if (!isRemoved(row.id)) known.set(row.id, row) }
       sessions.value = [...known.values()]
       if (Array.isArray(data.groups)) groups.value = data.groups
-      hasMoreSessions.value = Boolean(data.has_more)
-      sessionOffset = Number(data.offset || 0) + Number(data.limit || 200)
+      moreSessionPages = data.has_more === true
+      sessionOffset = Number(data.offset || 0) + Number(data.limit || sessionPageSize)
+      loaded = true
       if (selected.value) { const updated = known.get(selected.value.id); if (updated) selected.value = updated }
-    } catch (e) { globalNotice.value = e.message } finally { if (epoch === listEpoch) sessionsLoading.value = false }
+    } catch (e) { if (epoch === listEpoch && logged.value) sessionsError.value = e.message }
+    finally {
+      if (epoch === listEpoch) {
+        sessionsLoading.value = false
+        if (!more && loaded) scanSessions()
+      }
+    }
   }
-  async function loadMoreSessions() { await loadSessions(true) }
-  function scanSessions() {
+  async function loadMoreSessions() {
+    if (sessionsLoading.value || searching.value || !logged.value) return
+    if (sessionsError.value) {
+      if (sessionOffset === 0) await loadSessions()
+      else await scanSessions()
+      return
+    }
+    if (!hasMoreSessions.value) return
+    sessionLimit.value += sessionPageSize
+    await scanSessions()
+  }
+  function onSessionsScroll(event) {
+    const list = event.currentTarget
+    if (!hasMoreSessions.value || sessionsLoading.value || searching.value || sessionsError.value) return
+    if (list.scrollHeight - list.scrollTop - list.clientHeight <= 120) loadMoreSessions()
+  }
+  async function scanSessions() {
     clearTimeout(searchTimer); const epoch = ++searchEpoch
-    if (!filter.value.trim() && !groupFilter.value && section.value !== 'archive') { searching.value = false; return }
-    searchTimer = setTimeout(async () => {
-      searching.value = true
-      try {
-        // 标题只在已读取的数据中匹配，继续逐页读取；不调用可能修复或改写旧会话的标题接口。
-        while (epoch === searchEpoch && logged.value && hasMoreSessions.value) {
-          if (sessionsLoading.value) { await new Promise(resolve => setTimeout(resolve, 30)); continue }
-          const before = sessionOffset; await loadMoreSessions(); if (before === sessionOffset) break
-        }
-      } finally { if (epoch === searchEpoch) searching.value = false }
-    }, 350)
+    searching.value = logged.value && moreSessionPages && !hasMoreSessions.value
+    try {
+      // 先找到当前筛选下的下一条会话，再显示加载入口；空页和其他来源的记录继续跳过。
+      while (epoch === searchEpoch && logged.value && moreSessionPages && !hasMoreSessions.value) {
+        if (sessionsLoading.value) { await new Promise(resolve => setTimeout(resolve, 30)); continue }
+        const before = sessionOffset; await loadSessions(true); if (before === sessionOffset) break
+      }
+    } finally { if (epoch === searchEpoch) searching.value = false }
   }
-  watch([filter, section, groupFilter], scanSessions)
+  watch([filter, section, groupFilter], () => {
+    clearTimeout(searchTimer); searchEpoch++; sessionLimit.value = sessionPageSize
+    if (sessionList.value) sessionList.value.scrollTop = 0
+    if (hasMoreSessions.value) sessionsError.value = ''
+    searching.value = logged.value && moreSessionPages && !hasMoreSessions.value && !sessionsError.value
+    if (searching.value) searchTimer = setTimeout(scanSessions, 350)
+  })
+  watch(() => matchingSessions.value.length, (count, previous) => {
+    if (count < previous && !sessionsLoading.value && !searching.value && !sessionsError.value) scanSessions()
+  })
   watch([section, groupFilter], savePreferences)
 
   function clearHistoryTimer() { clearTimeout(historyTimer); historyTimer = null }
@@ -346,7 +380,8 @@ export function useHaven() {
 
   function openSessionActions(session = selected.value) { sessionAction.value = session; groupDialog.value = null; organizationError.value = '' }
   function openGroupDialog(group = null) { groupDialog.value = group ? { ...group } : { id: '', name: '' }; sessionAction.value = null; organizationError.value = '' }
-  function invalidateSessionList() { listEpoch++; sessionsLoading.value = false }
+  function invalidateSessionList() { clearTimeout(searchTimer); listEpoch++; searchEpoch++; sessionsLoading.value = false; searching.value = false }
+  function resumeSessionScan() { if (!sessionsLoading.value && !searching.value && !sessionsError.value) scanSessions() }
   async function organizeSession(patch) {
     if (!sessionAction.value || organizationBusy.value) return
     const id = sessionAction.value.id, currentWorkspace = workspace
@@ -357,7 +392,7 @@ export function useHaven() {
       for (const row of [sessions.value.find(s => s.id === id), selected.value?.id === id ? selected.value : null, sessionAction.value?.id === id ? sessionAction.value : null]) if (row) Object.assign(row, meta)
       savePreferences(); sessionAction.value = null
     } catch (e) { if (workspace === currentWorkspace && logged.value) organizationError.value = e.message }
-    finally { if (workspace === currentWorkspace) organizationBusy.value = false }
+    finally { if (workspace === currentWorkspace) { organizationBusy.value = false; resumeSessionScan() } }
   }
   async function saveGroup(name) {
     if (!groupDialog.value || organizationBusy.value) return
@@ -369,7 +404,7 @@ export function useHaven() {
       groups.value = result.groups; groupDialog.value = null
       if (!id) { groupFilter.value = result.id; section.value = 'all' }
     } catch (e) { if (workspace === currentWorkspace && logged.value) organizationError.value = e.message }
-    finally { if (workspace === currentWorkspace) organizationBusy.value = false }
+    finally { if (workspace === currentWorkspace) { organizationBusy.value = false; resumeSessionScan() } }
   }
   async function deleteGroup() {
     if (!groupDialog.value?.id || organizationBusy.value) return
@@ -383,7 +418,7 @@ export function useHaven() {
       if (groupFilter.value === id) groupFilter.value = ''
       savePreferences(); groupDialog.value = null
     } catch (e) { if (workspace === currentWorkspace && logged.value) organizationError.value = e.message }
-    finally { if (workspace === currentWorkspace) organizationBusy.value = false }
+    finally { if (workspace === currentWorkspace) { organizationBusy.value = false; resumeSessionScan() } }
   }
   function forgetSession(id) {
     removedSessions.add(id)
@@ -404,7 +439,7 @@ export function useHaven() {
       if (workspace !== currentWorkspace || !logged.value) return
       forgetSession(id)
       // 删除会使上游分页位置前移，重新加载首屏以免下一页漏掉会话。
-      await loadSessions(); scanSessions()
+      await loadSessions(); resumeSessionScan()
     } catch (e) {
       if (workspace === currentWorkspace && logged.value) {
         organizationError.value = e.message
@@ -412,7 +447,7 @@ export function useHaven() {
         for (const row of [sessions.value.find(s => s.id === id), selected.value?.id === id ? selected.value : null]) if (row) row.deletion_pending = pending
         savePreferences()
       }
-    } finally { if (workspace === currentWorkspace) organizationBusy.value = false }
+    } finally { if (workspace === currentWorkspace) { organizationBusy.value = false; resumeSessionScan() } }
   }
 
   async function uploadFiles(chosen) {
@@ -673,7 +708,7 @@ export function useHaven() {
     window.addEventListener('online', online); window.addEventListener('offline', offline); window.addEventListener('storage', storageChanged); window.addEventListener('pagehide', beforeUnload)
     try { identity.value = await api('/api/me'); logged.value = true; await initialize() } catch (e) { logged.value = false; if (e.network) loginError.value = '无法连接服务器，请恢复网络后重试。' }
   })
-  onUnmounted(() => { resetHistoryLoading(); stopContextRefresh(); beforeUnload(); closeStream(); clearTimeout(searchTimer); window.removeEventListener('online', online); window.removeEventListener('offline', offline); window.removeEventListener('storage', storageChanged); window.removeEventListener('pagehide', beforeUnload) })
+  onUnmounted(() => { invalidateSessionList(); resetHistoryLoading(); stopContextRefresh(); beforeUnload(); closeStream(); window.removeEventListener('online', online); window.removeEventListener('offline', offline); window.removeEventListener('storage', storageChanged); window.removeEventListener('pagehide', beforeUnload) })
 
-  return { groups, groupFilter, selectedGroup, actionBlocked, sessionAction, groupDialog, organizationBusy, organizationError, openSessionActions, openGroupDialog, organizeSession, saveGroup, deleteGroup, deleteSession, olderError, onHistoryScroll, contextUsage, contextLoading, contextError, loadContext, modelCatalog, modelsLoading, modelsError, loadModels, currentSettings, settingsLoading, settingsSaving, settingsBlocked, settingsError, saveSettings, loadSettings, newSessionOpen, newSessionSettings, newSessionError, creatingSession, openNewSession, controls, controlsSyncing, answerControl, respondControl, refreshControls, logged, username, password, identity, loginError, signingIn, sessions, filter, section, selected, messages: visibleMessages, loading, sidebar, editing, titleDraft, hasOlder, scroller, picker, health, sessionsLoading, hasMoreSessions, searching, olderLoading, globalNotice, text, files, pending, status, tools, liveText, sending, uploading, uploadQueue, previewFile, openPreview, loadPreviewText, dropFiles, isBusy, isUncertain, composerLocked, mine, notice, filtered, selectedTitle, statusLabel, sourceName, sessionTitle, timeLabel, login, logout, checkHealth, loadMoreSessions, choose, createSession, startRename, rename, attach, pasteImages, removeImage, send, retryPending, acknowledgePending, refreshStatus, stop, render }
+  return { groups, groupFilter, selectedGroup, actionBlocked, sessionAction, groupDialog, organizationBusy, organizationError, openSessionActions, openGroupDialog, organizeSession, saveGroup, deleteGroup, deleteSession, olderError, onHistoryScroll, contextUsage, contextLoading, contextError, loadContext, modelCatalog, modelsLoading, modelsError, loadModels, currentSettings, settingsLoading, settingsSaving, settingsBlocked, settingsError, saveSettings, loadSettings, newSessionOpen, newSessionSettings, newSessionError, creatingSession, openNewSession, controls, controlsSyncing, answerControl, respondControl, refreshControls, logged, username, password, identity, loginError, signingIn, sessions, filter, section, selected, messages: visibleMessages, loading, sidebar, editing, titleDraft, hasOlder, scroller, sessionList, onSessionsScroll, sessionsLoading, sessionsError, hasMoreSessions, searching, olderLoading, globalNotice, text, files, pending, status, tools, liveText, sending, uploading, uploadQueue, previewFile, openPreview, loadPreviewText, dropFiles, isBusy, isUncertain, composerLocked, mine, notice, filtered, selectedTitle, statusLabel, sourceName, sessionTitle, timeLabel, login, logout, checkHealth, loadMoreSessions, choose, createSession, startRename, rename, attach, pasteImages, removeImage, send, retryPending, acknowledgePending, refreshStatus, stop, render }
 }
