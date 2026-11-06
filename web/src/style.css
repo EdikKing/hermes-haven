@@ -381,8 +381,13 @@ button,input,textarea{transition:background-color .15s ease,border-color .15s ea
 .file-preview header strong{display:block;overflow-wrap:anywhere;font-size:14px}
 .file-preview header small{display:block;color:var(--text-muted);margin-top:4px;font-size:11px}
 .preview-download{display:flex;gap:5px;align-items:center;font-size:12px;color:var(--accent);text-decoration:none;flex-shrink:0}
-.preview-note{padding:10px 20px;font-size:11px;color:var(--text-secondary);background:var(--surface-subtle);border-bottom:1px solid var(--line);flex-shrink:0}
+.preview-note{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 20px;font-size:11px;color:var(--text-secondary);background:var(--surface-subtle);border-bottom:1px solid var(--line);flex-shrink:0}
+.preview-mode{flex:none;padding:4px 8px;border:1px solid var(--line-strong);border-radius:5px;background:var(--surface);color:var(--accent);font-size:11px}
+.preview-mode:hover{background:var(--accent-soft);border-color:var(--accent-line)}
 .text-preview{flex:1;min-height:0;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;padding:20px;margin:0;font:13px/1.7 ui-monospace,Consolas,monospace;color:var(--text)}
+.markdown-preview{flex:1;min-height:0;overflow:auto;padding:20px}
+.markdown-preview>:first-child{margin-top:0}
+.markdown-preview>:last-child{margin-bottom:0}
 .image-preview{flex:1;min-height:0;display:grid;place-items:center;overflow:auto;padding:18px;background:var(--surface-subtle)}
 .image-preview img{max-width:100%;max-height:100%;object-fit:contain}
 .pdf-preview{border:0;width:100%;flex:1;min-height:0;background:var(--surface-subtle)}

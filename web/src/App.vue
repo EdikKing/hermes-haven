@@ -93,6 +93,6 @@ const turns = computed(() => groupMessages(messages.value, { text: liveText.valu
     </main>
   </div>
   <SessionOrganizer :session="sessionAction" :group="groupDialog" :groups="groups" :title="sessionAction?sessionTitle(sessionAction):''" :busy="organizationBusy" :error="organizationError" :blocked="actionBlocked" @close="sessionAction=null;groupDialog=null" @organize="organizeSession" @save-group="saveGroup" @delete-group="deleteGroup" @delete-session="deleteSession"/>
-  <AttachmentPreview :file="previewFile" :load-text="loadPreviewText" @close="previewFile=null"/>
+  <AttachmentPreview :file="previewFile" :load-text="loadPreviewText" :render="render" @close="previewFile=null"/>
   <NewSessionDialog :open="newSessionOpen" v-model:settings="newSessionSettings" :catalog="modelCatalog" :loading="modelsLoading" :creating="creatingSession" :error="newSessionError" :model-error="modelsError" @close="newSessionOpen=false" @create="createSession" @retry="loadModels"/>
 </template>
