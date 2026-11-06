@@ -1,0 +1,24 @@
+/web/node_modules/
+/internal/web/dist/
+/data/
+
+# 本地环境配置
+.env
+.env.*
+!.env.example
+
+# 编译和测试产物
+/hermes-haven
+*.exe
+*.test
+*.out
+coverage/
+
+# 本地工具和临时文件
+__pycache__/
+*.py[cod]
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.log
