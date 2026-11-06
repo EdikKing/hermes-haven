@@ -19,7 +19,7 @@ export function useHaven() {
   const groups = ref([]), groupFilter = ref(''), sessionAction = ref(null), groupDialog = ref(null), organizationBusy = ref(false), organizationError = ref('')
   const removedSessions = new Set()
   const sidebar = ref(false), editing = ref(false), titleDraft = ref(''), hasOlder = ref(false), scroller = ref(null), sessionList = ref(null), picker = ref(null)
-  const health = ref('connecting'), sessionsLoading = ref(false), sessionsError = ref(''), searching = ref(false), olderLoading = ref(false), globalNotice = ref('')
+  const health = ref('connecting'), healthChecking = ref(false), healthError = ref(''), sessionsLoading = ref(false), sessionsError = ref(''), searching = ref(false), olderLoading = ref(false), globalNotice = ref('')
   const sessionPageSize = 200, sessionLimit = ref(sessionPageSize)
   let moreSessionPages = false
   const olderError = ref('')
@@ -33,8 +33,8 @@ export function useHaven() {
   let contextTimer = null
   const sessionModels = reactive({}), settingsReady = reactive({}), settingsErrors = reactive({}), settingsSavingIDs = reactive(new Set()), settingsLoadingIDs = reactive(new Set())
   const controlDrafts = reactive({})
-  let workspace = null, stream = null, pollTimer = null, searchTimer = null, checkpointTimer = null, statusTimer = null
-  let selectionEpoch = 0, listEpoch = 0, messageOffset = 0, sessionOffset = 0, searchEpoch = 0
+  let workspace = null, stream = null, pollTimer = null, searchTimer = null, checkpointTimer = null, statusTimer = null, healthTimer = null
+  let selectionEpoch = 0, listEpoch = 0, messageOffset = 0, sessionOffset = 0, searchEpoch = 0, healthRequestID = 0
   let modelsEpoch = 0
   let historyEpoch = 0, historyTimer = null, historyFailures = 0, historyRefreshing = false
 
@@ -147,9 +147,11 @@ export function useHaven() {
     try { await api('/api/logout', { method: 'POST', body: '{}' }) } catch (e) { if (e.status !== 401) { notice.value = '退出未完成，请恢复连接后重试。'; return } }
     savePreferences(); if (selected.value) saveCheckpoint(selected.value.id)
     resetHistoryLoading()
+    clearHealthTimer()
     stopContextRefresh(); closeStream(); selectionEpoch++; invalidateSessionList(); logged.value = false; selected.value = null; messages.value = []; password.value = ''; previewFile.value = null; newSessionOpen.value = false; sessionAction.value = null; groupDialog.value = null
   }
   async function initialize() {
+    clearHealthTimer()
     resetHistoryLoading()
     stopContextRefresh()
     closeStream(); selectionEpoch++; listEpoch++; searchEpoch++
@@ -179,7 +181,24 @@ export function useHaven() {
       await choose(restored)
     }
   }
-  async function checkHealth() { try { await api('/api/health'); health.value = 'online' } catch { health.value = 'offline' } }
+  function clearHealthTimer() { if (healthTimer) { clearTimeout(healthTimer); healthTimer = null } }
+  function scheduleHealthCheck() {
+    if (!logged.value || healthTimer) return
+    healthTimer = setTimeout(() => { healthTimer = null; if (logged.value) checkHealth() }, 15000)
+  }
+  async function checkHealth() {
+    const requestID = ++healthRequestID
+    clearHealthTimer()
+    healthChecking.value = true; healthError.value = ''
+    try {
+      await api('/api/health')
+      if (requestID === healthRequestID) health.value = 'online'
+    } catch (e) {
+      if (requestID === healthRequestID) { health.value = 'offline'; healthError.value = e.message || '连接检查失败'; scheduleHealthCheck() }
+    } finally {
+      if (requestID === healthRequestID) healthChecking.value = false
+    }
+  }
   function stopContextRefresh() { clearTimeout(contextTimer); contextTimer = null }
   function scheduleContextRefresh() {
     stopContextRefresh()
@@ -576,7 +595,7 @@ export function useHaven() {
       }
       scrollBottom()
     }
-    es.onerror = () => { if (stream !== es) return; saveCheckpoint(id); closeStream(); current.connected = false; health.value = 'offline'; scheduleRecover(id) }
+    es.onerror = () => { if (stream !== es) return; saveCheckpoint(id); closeStream(); current.connected = false; checkHealth(); scheduleRecover(id) }
   }
   async function recover(id = selected.value?.id) {
     if (!id || !logged.value || removedSessions.has(id)) return
@@ -611,7 +630,7 @@ export function useHaven() {
       if (!logged.value || accountWorkspace !== workspace || removedSessions.has(id) || recoveryVersion !== current.recoveryVersion) return
       current.controlsVerified = false
       if (e.status === 404) { current.controls = []; current.status = 'unavailable'; current.notice = '实时运行记录已不可用，请以保存的会话历史为准。'; return }
-      current.notice = '暂时无法核对运行状态：' + e.message; health.value = 'offline'; scheduleRecover(id)
+      current.notice = '暂时无法核对运行状态：' + e.message; health.value = 'offline'; scheduleHealthCheck(); scheduleRecover(id)
     } finally {
       if (accountWorkspace === workspace && recoveryVersion === current.recoveryVersion) {
         current.controlsSyncing = false
@@ -676,6 +695,7 @@ export function useHaven() {
   function online() { if (logged.value) { checkHealth(); if (selected.value) recover(selected.value.id) } }
   function offline() {
     health.value = 'offline'
+    scheduleHealthCheck()
     if (logged.value && selected.value) { const id = selected.value.id; saveCheckpoint(id); closeStream(); view(id).notice = '网络已断开，草稿和发送记录已保留。恢复连接后会重新核对运行。'; scheduleRecover(id) }
   }
   function storageChanged(event) {
@@ -710,5 +730,5 @@ export function useHaven() {
   })
   onUnmounted(() => { invalidateSessionList(); resetHistoryLoading(); stopContextRefresh(); beforeUnload(); closeStream(); window.removeEventListener('online', online); window.removeEventListener('offline', offline); window.removeEventListener('storage', storageChanged); window.removeEventListener('pagehide', beforeUnload) })
 
-  return { groups, groupFilter, selectedGroup, actionBlocked, sessionAction, groupDialog, organizationBusy, organizationError, openSessionActions, openGroupDialog, organizeSession, saveGroup, deleteGroup, deleteSession, olderError, onHistoryScroll, contextUsage, contextLoading, contextError, loadContext, modelCatalog, modelsLoading, modelsError, loadModels, currentSettings, settingsLoading, settingsSaving, settingsBlocked, settingsError, saveSettings, loadSettings, newSessionOpen, newSessionSettings, newSessionError, creatingSession, openNewSession, controls, controlsSyncing, answerControl, respondControl, refreshControls, logged, username, password, identity, loginError, signingIn, sessions, filter, section, selected, messages: visibleMessages, loading, sidebar, editing, titleDraft, hasOlder, scroller, sessionList, onSessionsScroll, sessionsLoading, sessionsError, hasMoreSessions, searching, olderLoading, globalNotice, text, files, pending, status, tools, liveText, sending, uploading, uploadQueue, previewFile, openPreview, loadPreviewText, dropFiles, isBusy, isUncertain, composerLocked, mine, notice, filtered, selectedTitle, statusLabel, sourceName, sessionTitle, timeLabel, login, logout, checkHealth, loadMoreSessions, choose, createSession, startRename, rename, attach, pasteImages, removeImage, send, retryPending, acknowledgePending, refreshStatus, stop, render }
+  return { groups, groupFilter, selectedGroup, actionBlocked, sessionAction, groupDialog, organizationBusy, organizationError, openSessionActions, openGroupDialog, organizeSession, saveGroup, deleteGroup, deleteSession, olderError, onHistoryScroll, contextUsage, contextLoading, contextError, loadContext, modelCatalog, modelsLoading, modelsError, loadModels, currentSettings, settingsLoading, settingsSaving, settingsBlocked, settingsError, saveSettings, loadSettings, newSessionOpen, newSessionSettings, newSessionError, creatingSession, openNewSession, controls, controlsSyncing, answerControl, respondControl, refreshControls, logged, username, password, identity, loginError, signingIn, sessions, filter, section, selected, messages: visibleMessages, loading, sidebar, editing, titleDraft, hasOlder, scroller, sessionList, onSessionsScroll, sessionsLoading, sessionsError, hasMoreSessions, searching, olderLoading, globalNotice, text, files, pending, status, tools, liveText, sending, uploading, uploadQueue, previewFile, openPreview, loadPreviewText, dropFiles, isBusy, isUncertain, composerLocked, mine, notice, filtered, selectedTitle, statusLabel, sourceName, sessionTitle, timeLabel, login, logout, health, healthChecking, healthError, checkHealth, loadMoreSessions, choose, createSession, startRename, rename, attach, pasteImages, removeImage, send, retryPending, acknowledgePending, refreshStatus, stop, render }
 }
