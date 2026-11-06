@@ -3,6 +3,7 @@ import MarkdownIt from 'markdown-it'
 import DOMPurify from 'dompurify'
 import { createWorkspace, emptyDraft, samePayload, mergeMessages, errorText } from './workspace.js'
 import { activeStatuses, uncertainStatuses, emptyRun, applyRunEvent } from './events.js'
+import { createOutgoingMessage, reconcileOutgoing, withOutgoingMessage } from './outgoing.js'
 
 export function useHaven() {
   const md = new MarkdownIt({ html: false, linkify: true, breaks: true })
@@ -15,12 +16,17 @@ export function useHaven() {
   const sidebar = ref(false), editing = ref(false), titleDraft = ref(''), hasOlder = ref(false), scroller = ref(null), picker = ref(null)
   const health = ref('connecting'), sessionsLoading = ref(false), hasMoreSessions = ref(false), searching = ref(false), olderLoading = ref(false), globalNotice = ref('')
   const drafts = reactive({}), runs = reactive({}), sendingIDs = reactive(new Set()), uploadingIDs = reactive({})
+  const outgoing = reactive({})
   let workspace = null, stream = null, pollTimer = null, searchTimer = null, checkpointTimer = null
   let selectionEpoch = 0, listEpoch = 0, messageOffset = 0, sessionOffset = 0, searchEpoch = 0
 
   function view(id) { return runs[id] || (runs[id] = emptyRun()) }
   function draft(id) { return drafts[id] || (drafts[id] = workspace?.draft(id) || emptyDraft()) }
   function persist(id) { if (workspace && drafts[id]) workspace.saveDraft(id, drafts[id]) }
+  function outgoingFor(id) { if (!(id in outgoing)) outgoing[id] = workspace?.outgoing(id) || null; return outgoing[id] }
+  function saveOutgoing(id, value) { outgoing[id] = value; workspace?.saveOutgoing(id, value) }
+  function clearOutgoing(id, requestID) { if (outgoingFor(id)?.requestID === requestID) saveOutgoing(id, null) }
+  const visibleMessages = computed(() => selected.value ? withOutgoingMessage(messages.value, outgoingFor(selected.value.id)) : [])
   const currentView = computed(() => selected.value ? view(selected.value.id) : emptyRun())
   const text = computed({ get: () => selected.value ? draft(selected.value.id).text : '', set: value => { if (selected.value) { draft(selected.value.id).text = value; persist(selected.value.id) } } })
   const files = computed(() => selected.value ? draft(selected.value.id).files : [])
@@ -88,6 +94,7 @@ export function useHaven() {
     closeStream(); selectionEpoch++; listEpoch++; searchEpoch++
     for (const key of Object.keys(drafts)) delete drafts[key]
     for (const key of Object.keys(runs)) delete runs[key]
+    for (const key of Object.keys(outgoing)) delete outgoing[key]
     selected.value = null; messages.value = []; filter.value = ''; sessions.value = []; globalNotice.value = ''
     workspace = createWorkspace(localStorage, identity.value.username, message => { globalNotice.value = message })
     const prefs = workspace.preferences(); section.value = prefs.section === 'history' ? 'history' : 'mine'
@@ -137,7 +144,7 @@ export function useHaven() {
   async function choose(session) {
     if (selected.value) saveCheckpoint(selected.value.id)
     closeStream(); const epoch = ++selectionEpoch
-    selected.value = session; draft(session.id); editing.value = false; sidebar.value = false; messages.value = []; messageOffset = 0; hasOlder.value = false; loading.value = true
+    selected.value = session; draft(session.id); outgoingFor(session.id); editing.value = false; sidebar.value = false; messages.value = []; messageOffset = 0; hasOlder.value = false; loading.value = true
     const checkpoint = workspace?.checkpoint(session.id)
     if (checkpoint?.runID && !runs[session.id]) Object.assign(view(session.id), checkpoint, { connected: false, retries: 0 })
     savePreferences()
@@ -154,6 +161,7 @@ export function useHaven() {
     if (data.history_notice) view(id).notice = data.history_notice
     const element = scroller.value, oldHeight = element?.scrollHeight || 0, oldTop = element?.scrollTop || 0
     messages.value = older ? mergeMessages(rows, messages.value) : rows
+    if (outgoingFor(id) && !reconcileOutgoing(messages.value, outgoingFor(id))) saveOutgoing(id, null)
     messageOffset = next; hasOlder.value = rows.length === 100
     if (older) await nextTick(() => { if (element) element.scrollTop = oldTop + element.scrollHeight - oldHeight })
   }
@@ -208,6 +216,7 @@ export function useHaven() {
     const id = selected.value.id, row = draft(id), existing = workspace?.draft(id).pending
     if (existing) { row.pending = existing; persist(id); await recover(id); return }
     row.pending = { text: row.text, images: row.files.map(f => f.id), request_id: randomToken(), created_at: Date.now() }; persist(id)
+    saveOutgoing(id, createOutgoingMessage(row.pending, row.files, messages.value)); scrollBottom()
     await submitPending(id)
   }
   async function submitPending(id) {
@@ -222,10 +231,10 @@ export function useHaven() {
       if (selected.value?.id === id && logged.value) { await recover(id); try { await loadMessages(false); scrollBottom() } catch (e) { view(id).notice = '运行已开始，历史暂未加载：' + e.message } }
       await loadSessions()
     } catch (e) {
-      if (e.data?.code === 'submission_pending') { row.pending = null; persist(id); await recover(id) }
+      if (e.data?.code === 'submission_pending') { clearOutgoing(id, request.request_id); row.pending = null; persist(id); await recover(id) }
       else if (!e.status || e.status >= 500 || ['retry_unsafe', 'request_conflict'].includes(e.data?.code)) { view(id).status = 'submission_unknown'; view(id).notice = e.message; saveCheckpoint(id) }
       else if (e.status === 401 && e.data?.code === 'login_required') { view(id).status = 'submission_unknown' }
-      else { row.pending = null; persist(id); view(id).status = 'idle'; view(id).notice = e.message }
+      else { clearOutgoing(id, request.request_id); row.pending = null; persist(id); view(id).status = 'idle'; view(id).notice = e.message }
     } finally { sendingIDs.delete(id) }
   }
   async function checkPending(id) {
@@ -234,8 +243,8 @@ export function useHaven() {
     try {
       const data = await api(`/api/sessions/${id}/requests/${request.request_id}`)
       if (data.state === 'accepted') accepted(id, request, data.run_id, 'started')
-      else if (data.state === 'rejected') { row.pending = null; persist(id); view(id).status = 'idle'; view(id).notice = errorText(data.response?.error) || 'Hermes 已拒绝本次请求，原草稿已保留。' }
-      else if (data.state === 'acknowledged') { row.pending = null; persist(id); view(id).status = 'idle'; view(id).notice = '原请求已核对并解除等待，未重新执行。' }
+      else if (data.state === 'rejected') { clearOutgoing(id, request.request_id); row.pending = null; persist(id); view(id).status = 'idle'; view(id).notice = errorText(data.response?.error) || 'Hermes 已拒绝本次请求，原草稿已保留。' }
+      else if (data.state === 'acknowledged') { clearOutgoing(id, request.request_id); row.pending = null; persist(id); view(id).status = 'idle'; view(id).notice = '原请求已核对并解除等待，未重新执行。' }
       else { view(id).status = 'submission_unknown'; view(id).notice = '发送结果尚未确认。核对不会重新发送消息；安全重试会沿用原请求编号。' }
     } catch (e) { if (e.status !== 404) throw e; view(id).status = 'submission_unknown'; view(id).notice = '服务器尚无本次请求的发送记录，可以点击“安全重试原请求”。' }
   }
@@ -250,7 +259,7 @@ export function useHaven() {
     const id = selected.value.id, row = draft(id), request = row.pending
     try {
       await api(`/api/sessions/${id}/requests/${request.request_id}/acknowledge`, { method: 'POST', body: JSON.stringify({ confirmed: true }) })
-      row.pending = null; persist(id); view(id).status = 'idle'; view(id).notice = '已解除本地等待，原草稿保留。没有停止或重新执行 Hermes 运行。'
+      clearOutgoing(id, request.request_id); row.pending = null; persist(id); view(id).status = 'idle'; view(id).notice = '已解除本地等待，原草稿保留。没有停止或重新执行 Hermes 运行。'
       await recover(id)
     } catch (e) { view(id).notice = e.message }
   }
@@ -328,6 +337,11 @@ export function useHaven() {
     if (logged.value && selected.value) { const id = selected.value.id; saveCheckpoint(id); closeStream(); view(id).notice = '网络已断开，草稿和发送记录已保留。恢复连接后会重新核对运行。'; scheduleRecover(id) }
   }
   function storageChanged(event) {
+    if (workspace && selected.value && event.key === workspace.prefix + 'outgoing:' + selected.value.id) {
+      const id = selected.value.id, incoming = workspace.outgoing(id)
+      if (incoming) outgoing[id] = incoming
+      recover(id)
+    }
     if (workspace && selected.value && event.key === workspace.prefix + 'draft:' + selected.value.id) {
       const id = selected.value.id
       try { const incoming = JSON.parse(event.newValue); if (incoming?.pending && !draft(id).pending) draft(id).pending = incoming.pending } catch {}
@@ -342,5 +356,5 @@ export function useHaven() {
   })
   onUnmounted(() => { beforeUnload(); closeStream(); clearTimeout(searchTimer); window.removeEventListener('online', online); window.removeEventListener('offline', offline); window.removeEventListener('storage', storageChanged); window.removeEventListener('pagehide', beforeUnload) })
 
-  return { logged, username, password, identity, loginError, signingIn, sessions, filter, section, selected, messages, loading, sidebar, editing, titleDraft, hasOlder, scroller, picker, health, sessionsLoading, hasMoreSessions, searching, olderLoading, globalNotice, text, files, pending, status, tools, liveText, sending, uploading, isBusy, isUncertain, composerLocked, mine, notice, filtered, selectedTitle, statusLabel, sourceName, sessionTitle, timeLabel, login, logout, checkHealth, loadMoreSessions, choose, moreHistory, createSession, startRename, rename, attach, pasteImages, removeImage, send, retryPending, acknowledgePending, refreshStatus, stop, render }
+  return { logged, username, password, identity, loginError, signingIn, sessions, filter, section, selected, messages: visibleMessages, loading, sidebar, editing, titleDraft, hasOlder, scroller, picker, health, sessionsLoading, hasMoreSessions, searching, olderLoading, globalNotice, text, files, pending, status, tools, liveText, sending, uploading, isBusy, isUncertain, composerLocked, mine, notice, filtered, selectedTitle, statusLabel, sourceName, sessionTitle, timeLabel, login, logout, checkHealth, loadMoreSessions, choose, moreHistory, createSession, startRename, rename, attach, pasteImages, removeImage, send, retryPending, acknowledgePending, refreshStatus, stop, render }
 }

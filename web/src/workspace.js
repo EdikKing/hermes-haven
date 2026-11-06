@@ -14,6 +14,11 @@ export function createWorkspace(storage, username, onError = () => {}) {
     prefix,
     preferences: () => read('preferences', {}),
     savePreferences: value => write('preferences', value),
+    outgoing(id) {
+      const value = read('outgoing:' + id, null)
+      return value && typeof value.requestID === 'string' && Array.isArray(value.before) && value.message?.role === 'user' ? value : null
+    },
+    saveOutgoing: (id, value) => write('outgoing:' + id, value),
     draft(id) {
       const value = read('draft:' + id, null)
       if (!value || typeof value.text !== 'string' || !Array.isArray(value.files)) return emptyDraft()
