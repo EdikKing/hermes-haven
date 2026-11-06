@@ -26,9 +26,10 @@ import (
 )
 
 type ownedSession struct {
-	Title    string `json:"title"`
-	RunID    string `json:"run_id,omitempty"`
-	External bool   `json:"external,omitempty"`
+	Title    string         `json:"title"`
+	RunID    string         `json:"run_id,omitempty"`
+	External bool           `json:"external,omitempty"`
+	Settings *modelSettings `json:"settings,omitempty"`
 }
 type state struct {
 	Sessions map[string]ownedSession `json:"sessions"`
@@ -350,13 +351,23 @@ func (s *server) list(w http.ResponseWriter, r *http.Request) {
 				row["haven_title"] = own.Title
 			}
 			row["run_id"] = own.RunID
+			row["settings"] = own.Settings
 		}
 	}
 	jsonOut(w, 200, data)
 }
 func (s *server) create(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Settings modelSettings `json:"settings"`
+	}
+	if json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&body) != nil || !body.Settings.valid() {
+		fail(w, 400, "模型或思考强度无效")
+		return
+	}
 	id := "haven_" + randomID(16)
-	res, err := s.upstream(r.Context(), "POST", "/api/sessions", map[string]any{"id": id}, nil)
+	payload := map[string]any{"id": id}
+	body.Settings.apply(payload)
+	res, err := s.upstream(r.Context(), "POST", "/api/sessions", payload, nil)
 	if err != nil {
 		fail(w, 502, "创建会话失败")
 		return
@@ -366,19 +377,20 @@ func (s *server) create(w http.ResponseWriter, r *http.Request) {
 		fail(w, 502, "Hermes 未能创建会话")
 		return
 	}
-	if err = s.setOwned(id, ownedSession{Title: "新会话"}); err != nil {
+	if err = s.setOwned(id, ownedSession{Title: "新会话", Settings: &body.Settings}); err != nil {
 		fail(w, 500, "会话已创建但本地登记失败，已禁止写入该会话")
 		return
 	}
-	jsonOut(w, 201, map[string]any{"id": id, "title": "新会话"})
+	jsonOut(w, 201, map[string]any{"id": id, "title": "新会话", "settings": body.Settings})
 }
 func (s *server) send(w http.ResponseWriter, r *http.Request, id string) {
 	var b struct {
-		Text      string   `json:"text"`
-		Images    []string `json:"images"`
-		Files     []string `json:"files"`
-		RequestID string   `json:"request_id"`
-		CreatedAt int64    `json:"created_at"`
+		Text      string         `json:"text"`
+		Images    []string       `json:"images"`
+		Files     []string       `json:"files"`
+		RequestID string         `json:"request_id"`
+		CreatedAt int64          `json:"created_at"`
+		Settings  *modelSettings `json:"settings"`
 	}
 	if json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&b) != nil {
 		fail(w, 400, "请求无效")
@@ -389,7 +401,11 @@ func (s *server) send(w http.ResponseWriter, r *http.Request, id string) {
 		fail(w, 400, "消息、附件或请求编号无效")
 		return
 	}
-	s.submit(w, r, id, b.RequestID, b.Text, b.Images, b.Files, b.CreatedAt)
+	if b.Settings != nil && !b.Settings.valid() {
+		fail(w, 400, "模型或思考强度无效")
+		return
+	}
+	s.submit(w, r, id, b.RequestID, b.Text, b.Images, b.Files, b.CreatedAt, b.Settings)
 }
 func (s *server) events(w http.ResponseWriter, r *http.Request, id string) {
 	own, ok := s.owned(id)
@@ -491,6 +507,11 @@ func (s *server) api(w http.ResponseWriter, r *http.Request) {
 	case "/api/health":
 		s.proxyJSON(w, r, "GET", "/v1/capabilities", nil)
 		return
+	case "/api/models":
+		if r.Method == "GET" {
+			s.models(w, r)
+			return
+		}
 	case "/api/sessions":
 		if r.Method == "GET" {
 			s.list(w, r)
@@ -524,6 +545,8 @@ func (s *server) api(w http.ResponseWriter, r *http.Request) {
 	}
 	id := parts[0]
 	switch {
+	case len(parts) == 2 && parts[1] == "settings" && (r.Method == "GET" || r.Method == "PUT"):
+		s.sessionSettings(w, r, id)
 	case len(parts) == 2 && parts[1] == "messages" && r.Method == "GET":
 		s.messages(w, r, id)
 	case len(parts) == 2 && parts[1] == "runs" && r.Method == "POST":
@@ -532,6 +555,8 @@ func (s *server) api(w http.ResponseWriter, r *http.Request) {
 		s.events(w, r, id)
 	case len(parts) == 2 && parts[1] == "status" && r.Method == "GET":
 		s.sessionStatus(w, r, id)
+	case len(parts) == 2 && (parts[1] == "approval" || parts[1] == "clarify") && r.Method == "POST":
+		s.respondControl(w, r, id, parts[1])
 	case len(parts) == 3 && parts[1] == "requests" && validID(parts[2]) && r.Method == "GET":
 		s.requestStatus(w, r, id, parts[2])
 	case len(parts) == 4 && parts[1] == "requests" && validID(parts[2]) && parts[3] == "acknowledge" && r.Method == "POST":
@@ -556,8 +581,19 @@ func (s *server) api(w http.ResponseWriter, r *http.Request) {
 			fail(w, 400, "标题无效")
 			return
 		}
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		// 读取最新会话再只更新标题，保留同时保存的模型选择和运行关联。
+		own, ok = s.st.Sessions[id]
+		if !ok || own.External {
+			fail(w, 403, "无法修改历史会话标题")
+			return
+		}
+		previous := own
 		own.Title = strings.TrimSpace(b.Title)
-		if s.setOwned(id, own) != nil {
+		s.st.Sessions[id] = own
+		if s.saveLocked() != nil {
+			s.st.Sessions[id] = previous
 			fail(w, 500, "保存失败")
 			return
 		}

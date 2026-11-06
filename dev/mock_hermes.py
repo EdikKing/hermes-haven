@@ -5,6 +5,9 @@ import os
 import threading
 import time
 import uuid
+import re
+import base64
+from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 lock = threading.RLock()
@@ -35,7 +38,17 @@ def finish(run):
             return
         failed = run["mode"] == "tool_error"
         run["status"] = "failed" if failed else "completed"
-        messages[run["session_id"]].append({"id": len(messages[run["session_id"]]) + 1, "role": "assistant", "content": "文件不存在，工具执行失败。" if failed else "你好，验收回复已经保存。"})
+        reply = "文件不存在，工具执行失败。" if failed else "你好，验收回复已经保存。"
+        match = re.search(r'本次目录 ("(?:\\.|[^"\\])*")', run.get("input_text", ""))
+        if match and run["mode"] == "artifact":
+            output = Path(json.loads(match.group(1)))
+            allowed = os.environ.get("MOCK_OUTPUT_ROOT", "")
+            if allowed and output.is_relative_to(Path(allowed)):
+                output.mkdir(parents=True, exist_ok=True)
+                target = output / "模拟生成 中文.csv"
+                target.write_text("name,value\nhaven,42\n", encoding="utf-8")
+                reply = "文件已生成：[模拟生成 中文.csv](sandbox:" + str(target).replace(" ", "%20") + ")"
+        messages[run["session_id"]].append({"id": len(messages[run["session_id"]]) + 1, "role": "assistant", "content": reply})
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -55,6 +68,8 @@ class Handler(BaseHTTPRequestHandler):
             if "hermes_session_at=preview-only-token" not in self.headers.get("Cookie", ""): return self.answer(401, {"detail": "Unauthorized"})
             return self.answer(200, {"user_id": "preview", "display_name": "本机预览", "provider": "basic", "expires_at": int(time.time()) + 3600})
         if path == "/v1/capabilities": return self.answer(200, {"features": {"run_submission": True, "runs_idempotency": {"supported": True, "durable": True, "retention_seconds": 86400}}})
+        if path == "/api/model/options":
+            return self.answer(200, {"model": "preview-reasoner", "provider": "preview", "providers": [{"slug": "preview", "name": "本机预览", "authenticated": True, "models": ["preview-reasoner", "preview-fast", "preview-model-with-a-very-long-name-for-mobile-layout"], "capabilities": {"preview-reasoner": {"reasoning": True}, "preview-fast": {"reasoning": False}}}]})
         if path == "/api/sessions":
             offset, limit = int(query.get("offset", [0])[0]), int(query.get("limit", [200])[0])
             return self.answer(200, {"data": sessions[offset:offset+limit], "offset": offset, "limit": limit, "has_more": offset + limit < len(sessions)})
@@ -115,7 +130,18 @@ class Handler(BaseHTTPRequestHandler):
                 mode = control["mode"]
                 runs[run_id] = {"session_id": sid, "status": "running", "mode": mode, "finish_at": time.time() + float(control["delay"])}
                 reservations[key] = run_id
-                content = data["input"] if isinstance(data["input"], str) else "图片验收消息"
+                content = data["input"] if isinstance(data["input"], str) else data["input"][-1]["content"]
+                if isinstance(content, list):
+                    text = "\n".join(part.get("text", "") for part in content if part.get("type") == "text")
+                    image_root = os.environ.get("MOCK_IMAGE_ROOT", "")
+                    for part in content:
+                        if part.get("type") == "image_url" and image_root:
+                            target = Path(image_root) / (uuid.uuid4().hex + ".png")
+                            target.parent.mkdir(parents=True, exist_ok=True)
+                            target.write_bytes(base64.b64decode(part["image_url"]["url"].split(",", 1)[1]))
+                            text += "\n\n[Image attached at: " + str(target) + "]"
+                    content = text
+                runs[run_id]["input_text"] = content
                 messages[sid].append({"id": len(messages[sid])+1, "role": "user", "content": content})
                 control["mode"] = "normal"
             if mode == "unknown": return self.answer(503, {"error": "故障注入：已受理但响应丢失"})
@@ -128,5 +154,6 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    print("模拟 Hermes：http://127.0.0.1:18642", flush=True)
-    ThreadingHTTPServer(("127.0.0.1", 18642), Handler).serve_forever()
+    port = int(os.environ.get("MOCK_PORT", "18642"))
+    print(f"模拟 Hermes：http://127.0.0.1:{port}", flush=True)
+    ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()

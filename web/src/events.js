@@ -4,7 +4,7 @@ export const activeStatuses = new Set(['queued', 'running', 'waiting_for_approva
 export const uncertainStatuses = new Set(['submission_unknown', 'unknown', 'owner_lost'])
 const terminalEvents = new Set(['run.completed', 'run.failed', 'run.cancelled', 'run.interrupted', 'run.rejected'])
 
-export function emptyRun() { return { runID: '', lastSeq: -1, liveText: '', tools: [], status: 'idle', notice: '', retries: 0, connected: false } }
+export function emptyRun() { return { runID: '', lastSeq: -1, liveText: '', tools: [], controls: [], controlsSyncing: false, status: 'idle', notice: '', retries: 0, connected: false } }
 
 export function applyRunEvent(view, event) {
   if (Number.isInteger(event.seq)) {
@@ -36,11 +36,12 @@ export function applyRunEvent(view, event) {
       if (failed) view.notice = tool.name + '：' + tool.error
       break
     }
-    case 'approval.request': view.status = 'waiting_for_approval'; view.notice = 'Hermes 正在等待审批。当前版本请在原有 Hermes 界面处理，或停止运行。'; break
+    case 'approval.request': case 'clarify.request': case 'approval.responded': case 'approval.settled': case 'clarify.settled': return { controlsChanged: true }
     case 'replay.truncated': view.notice = '部分实时过程已过期，运行结束后会从历史恢复最终消息。'; break
     case 'run.unknown': view.status = 'unknown'; view.notice = 'Hermes 无法确认该运行是否完成，请核对历史；当前不会自动重新执行。'; break
   }
   if (terminalEvents.has(event.event)) {
+    view.controls = []
     view.status = event.event.slice(4)
     if (event.error) view.notice = errorText(event.error)
     return { terminal: true }

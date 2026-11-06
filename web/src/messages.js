@@ -50,7 +50,7 @@ export function groupMessages(messages, live = {}) {
       turns.push(current)
       resetTools()
     } else if (message.role === 'assistant') {
-      if (messageText(message).trim() || imageBlocks(message).length) {
+      if (messageText(message).trim() || imageBlocks(message).length || message.attachments?.length || message.attachment_notice) {
         assistant(key, message.timestamp).blocks.push({ key, type: 'content', message })
         resetTools()
       }

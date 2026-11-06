@@ -23,6 +23,7 @@ function backend(options = {}) {
   const gate = new Promise(resolve => { release = resolve })
   const server = {
     streams: [], submissions: 0, run: false, status: 'running', request: null,
+    settings: { one: {}, two: {} }, createdSettings: null, settingsFailure: false,
     history: {
       one: [{ id: 1, role: 'user', content: '再解释一下' }, { id: 2, role: 'assistant', content: '上一轮的回复' }],
       two: [{ id: 10, role: 'user', content: '另一个会话' }],
@@ -33,8 +34,20 @@ function backend(options = {}) {
       const reply = (value, status = 200) => new Response(JSON.stringify(value), { status, headers: { 'Content-Type': 'application/json' } })
       if (path === '/api/me') return reply({ username: 'preview' })
       if (path === '/api/health') return reply({})
-      if (path === '/api/sessions') return reply({ data: ['one', 'two'].map(id => ({ id, owned: true, title: id })), has_more: false })
-      const history = path.match(/^\/api\/sessions\/(one|two)\/messages$/)
+      if (path === '/api/models') return reply({ model: 'model-a', provider: 'provider-a', providers: [{ slug: 'provider-a', name: '测试供应商', models: ['model-a', 'model-b'] }] })
+      if (path === '/api/sessions' && init.method === 'POST') {
+        server.createdSettings = JSON.parse(init.body).settings
+        server.settings.new_session = server.createdSettings; server.history.new_session = []
+        return reply({ id: 'new_session', title: '新会话', settings: server.createdSettings }, 201)
+      }
+      if (path === '/api/sessions') return reply({ data: Object.keys(server.history).map(id => ({ id, owned: true, title: id })), has_more: false })
+      const settings = path.match(/^\/api\/sessions\/([^/]+)\/settings$/)
+      if (settings) {
+        if (server.settingsFailure) return reply({ error: '设置服务暂不可用' }, 503)
+        if (init.method === 'PUT') server.settings[settings[1]] = JSON.parse(init.body)
+        return reply(server.settings[settings[1]] || {})
+      }
+      const history = path.match(/^\/api\/sessions\/([^/]+)\/messages$/)
       if (history) return reply({ data: server.history[history[1]] })
       if (path === '/api/sessions/one/runs') {
         server.submissions++; server.request = JSON.parse(init.body)
@@ -82,7 +95,7 @@ async function mount(server, storage = memoryStorage()) {
     names.forEach((name, index) => { if (saved[index]) Object.defineProperty(globalThis, name, saved[index]); else delete globalThis[name] })
   }
   try {
-    await until(() => haven.sessions.value.length === 2)
+    await until(() => haven.sessions.value.length >= 2)
     if (!haven.selected.value) await haven.choose(haven.sessions.value[0])
     await until(() => !haven.loading.value)
     return { haven, storage, dispose }
@@ -180,4 +193,63 @@ test('大量工具记录挤出发送前的历史边界时，用户消息仍排�
   const full = [...before, { id: 2, role: 'user', content: '长任务' }, ...recent]
   assert.equal(reconcileOutgoing(full, outgoing), null)
   assert.equal(withOutgoingMessage(full, outgoing), full)
+})
+
+test('新建先选择模型与强度，创建后输入框继承设置，取消不创建会话', async () => {
+  const server = backend(), client = await mount(server), h = client.haven
+  try {
+    h.openNewSession()
+    assert.equal(h.newSessionOpen.value, true)
+    assert.equal(server.createdSettings, null)
+    h.newSessionOpen.value = false
+    assert.equal(server.createdSettings, null)
+    const settings = { model: 'model-b', provider: 'provider-a', reasoning_effort: 'high' }
+    h.openNewSession(); h.newSessionSettings.value = settings
+    await h.createSession()
+    assert.deepEqual(server.createdSettings, settings)
+    assert.deepEqual(h.currentSettings.value, settings)
+    assert.equal(h.newSessionOpen.value, false)
+    assert.equal(h.selected.value.id, 'new_session')
+  } finally { client.dispose() }
+})
+
+test('输入框设置按会话保存并在刷新后恢复，运行期间修改只影响下次发送', async () => {
+  const server = backend(), storage = memoryStorage()
+  let client = await mount(server, storage), h = client.haven
+  try {
+    const first = { model: 'model-a', provider: 'provider-a', reasoning_effort: 'high' }
+    const next = { model: 'model-b', provider: 'provider-a', reasoning_effort: 'low' }
+    await h.saveSettings(first)
+    h.text.value = '使用已选模型'; await h.send()
+    assert.deepEqual(server.request.settings, first)
+    await h.saveSettings(next)
+    assert.deepEqual(h.currentSettings.value, next)
+    assert.deepEqual(server.request.settings, first)
+    await h.choose(h.sessions.value.find(s => s.id === 'two'))
+    assert.deepEqual(h.currentSettings.value, { model: '', provider: '', reasoning_effort: '' })
+    await h.choose(h.sessions.value.find(s => s.id === 'one'))
+    assert.deepEqual(h.currentSettings.value, next)
+    client.dispose(); client = await mount(server, storage); h = client.haven
+    assert.deepEqual(h.currentSettings.value, next)
+    assert.deepEqual(h.newSessionSettings.value, next)
+    assert.equal(server.submissions, 1)
+  } finally { client.dispose() }
+})
+
+test('设置保存失败回到原选择，读取失败时禁止带错误默认值发送，重读后可恢复', async () => {
+  const server = backend(), client = await mount(server), h = client.haven
+  try {
+    const first = { model: 'model-a', provider: 'provider-a', reasoning_effort: 'medium' }
+    await h.saveSettings(first); server.settingsFailure = true
+    await h.saveSettings({ ...first, reasoning_effort: 'high' })
+    assert.deepEqual(h.currentSettings.value, first)
+    assert.match(h.settingsError.value, /设置未保存/)
+    await h.choose(h.sessions.value.find(s => s.id === 'two'))
+    h.text.value = '读取失败不能发送'; await h.send()
+    assert.equal(server.submissions, 0)
+    assert.equal(h.settingsBlocked.value, true)
+    server.settingsFailure = false; await h.loadSettings()
+    assert.equal(h.settingsBlocked.value, false)
+    assert.equal(h.settingsError.value, '')
+  } finally { client.dispose() }
 })

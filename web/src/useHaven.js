@@ -4,6 +4,9 @@ import DOMPurify from 'dompurify'
 import { createWorkspace, emptyDraft, samePayload, mergeMessages, errorText } from './workspace.js'
 import { activeStatuses, uncertainStatuses, emptyRun, applyRunEvent } from './events.js'
 import { createOutgoingMessage, reconcileOutgoing, withOutgoingMessage } from './outgoing.js'
+import { normalizeAttachment, attachmentPayload, validateUploads } from './attachments.js'
+import { normalizeSettings } from './modelSettings.js'
+import { pendingControls } from './controls.js'
 
 export function useHaven() {
   const md = new MarkdownIt({ html: false, linkify: true, breaks: true })
@@ -16,9 +19,16 @@ export function useHaven() {
   const sidebar = ref(false), editing = ref(false), titleDraft = ref(''), hasOlder = ref(false), scroller = ref(null), picker = ref(null)
   const health = ref('connecting'), sessionsLoading = ref(false), hasMoreSessions = ref(false), searching = ref(false), olderLoading = ref(false), globalNotice = ref('')
   const drafts = reactive({}), runs = reactive({}), sendingIDs = reactive(new Set()), uploadingIDs = reactive({})
+  const previewFile = ref(null)
   const outgoing = reactive({})
-  let workspace = null, stream = null, pollTimer = null, searchTimer = null, checkpointTimer = null
+  const modelCatalog = ref({ providers: [], model: '', provider: '' }), modelsLoading = ref(false), modelsError = ref('')
+  const newSessionOpen = ref(false), newSessionSettings = ref(normalizeSettings()), creatingSession = ref(false), newSessionError = ref('')
+  const newSessionDefaults = ref(normalizeSettings())
+  const sessionModels = reactive({}), settingsReady = reactive({}), settingsErrors = reactive({}), settingsSavingIDs = reactive(new Set()), settingsLoadingIDs = reactive(new Set())
+  const controlDrafts = reactive({})
+  let workspace = null, stream = null, pollTimer = null, searchTimer = null, checkpointTimer = null, statusTimer = null
   let selectionEpoch = 0, listEpoch = 0, messageOffset = 0, sessionOffset = 0, searchEpoch = 0
+  let modelsEpoch = 0
 
   function view(id) { return runs[id] || (runs[id] = emptyRun()) }
   function draft(id) { return drafts[id] || (drafts[id] = workspace?.draft(id) || emptyDraft()) }
@@ -28,6 +38,16 @@ export function useHaven() {
   function clearOutgoing(id, requestID) { if (outgoingFor(id)?.requestID === requestID) saveOutgoing(id, null) }
   const visibleMessages = computed(() => selected.value ? withOutgoingMessage(messages.value, outgoingFor(selected.value.id)) : [])
   const currentView = computed(() => selected.value ? view(selected.value.id) : emptyRun())
+  function controlState(id, p) {
+    const key = id + ':' + p.key
+    if (!controlDrafts[key]) {
+      const saved = workspace?.control(id, p.key) || { answer: '', unknown: false }
+      controlDrafts[key] = { ...saved, sending: false, error: saved.unknown ? '上次提交结果尚未确认，请先核对状态；不会自动重发。' : '' }
+    }
+    return controlDrafts[key]
+  }
+  const controls = computed(() => selected.value ? currentView.value.controls.map(p => ({ ...p, state: controlState(selected.value.id, p) })) : [])
+  const controlsSyncing = computed(() => currentView.value.controlsSyncing || !currentView.value.controlsVerified || currentView.value.status === 'stopping' || health.value !== 'online')
   const text = computed({ get: () => selected.value ? draft(selected.value.id).text : '', set: value => { if (selected.value) { draft(selected.value.id).text = value; persist(selected.value.id) } } })
   const files = computed(() => selected.value ? draft(selected.value.id).files : [])
   const pending = computed(() => selected.value ? draft(selected.value.id).pending : null)
@@ -35,15 +55,21 @@ export function useHaven() {
   const tools = computed(() => currentView.value.tools)
   const liveText = computed(() => currentView.value.liveText)
   const sending = computed(() => selected.value && sendingIDs.has(selected.value.id))
-  const uploading = computed(() => selected.value ? uploadingIDs[selected.value.id] || 0 : 0)
+  const uploadQueue = computed(() => selected.value ? uploadingIDs[selected.value.id] || [] : [])
+  const uploading = computed(() => uploadQueue.value.length)
   const isBusy = computed(() => activeStatuses.has(status.value))
   const isUncertain = computed(() => uncertainStatuses.has(status.value))
   const composerLocked = computed(() => isBusy.value || isUncertain.value || sending.value || Boolean(pending.value))
+  const currentSettings = computed(() => normalizeSettings(selected.value ? sessionModels[selected.value.id] : null))
+  const settingsSaving = computed(() => Boolean(selected.value && settingsSavingIDs.has(selected.value.id)))
+  const settingsLoading = computed(() => Boolean(selected.value && settingsLoadingIDs.has(selected.value.id)))
+  const settingsBlocked = computed(() => Boolean(selected.value && (!settingsReady[selected.value.id] || settingsLoading.value || settingsSaving.value)))
+  const settingsError = computed(() => selected.value ? settingsErrors[selected.value.id] || '' : '')
   const mine = computed(() => selected.value?.owned === true)
   const notice = computed({ get: () => currentView.value.notice || globalNotice.value, set: value => { if (selected.value) { globalNotice.value = ''; view(selected.value.id).notice = value } else globalNotice.value = value } })
   const filtered = computed(() => sessions.value.filter(s => (section.value === 'mine' ? s.owned : !s.owned) && sessionTitle(s).toLowerCase().includes(filter.value.toLowerCase())))
   const selectedTitle = computed(() => selected.value ? sessionTitle(selected.value) : '一个安静的地方，和 Hermes 一起思考')
-  const statusLabel = computed(() => ({ queued: '正在排队', started: '正在开始', running: '正在思考', waiting_for_approval: '等待审批', stopping: '正在停止', completed: '已完成', failed: '运行失败', cancelled: '已停止', interrupted: '运行中断', unknown: '运行结果待核对', submission_unknown: '发送结果待核对' }[status.value] || '本次运行'))
+  const statusLabel = computed(() => controls.value.length ? (controls.value.some(p => p.kind === 'approval') ? '等待审批' : '等待补充回答') : ({ queued: '正在排队', started: '正在开始', running: '正在思考', waiting_for_approval: '等待审批', stopping: '正在停止', completed: '已完成', failed: '运行失败', cancelled: '已停止', interrupted: '运行中断', unknown: '运行结果待核对', submission_unknown: '发送结果待核对' }[status.value] || '本次运行'))
   const sourceName = source => ({ api_server: 'API', cli: 'CLI', oneshot: 'CLI', weixin: '微信', feishu: '飞书', telegram: 'Telegram', tui: 'TUI', cron: '定时任务' }[source] || source || 'Hermes')
   function sessionTitle(s) { return s.haven_title || s.title || s.preview || '未命名会话' }
   function timeLabel(t) { if (!t) return ''; const d = new Date(Number(t) * 1000); if (isNaN(d)) return ''; return d.toDateString() === new Date().toDateString() ? d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }) : d.toLocaleDateString('zh-CN', { month: 'short', day: 'numeric' }) }
@@ -52,12 +78,15 @@ export function useHaven() {
     if (stream) { stream.close(); stream = null }
     if (pollTimer) { clearTimeout(pollTimer); pollTimer = null }
     if (checkpointTimer) { clearTimeout(checkpointTimer); checkpointTimer = null }
+    if (statusTimer) { clearTimeout(statusTimer); statusTimer = null }
   }
   function savePreferences() {
-    workspace?.savePreferences({ section: section.value, selected: selected.value ? { id: selected.value.id, title: selectedTitle.value, source: selected.value.source, owned: selected.value.owned } : null })
+    workspace?.savePreferences({ section: section.value, newSessionSettings: newSessionDefaults.value, selected: selected.value ? { id: selected.value.id, title: selectedTitle.value, source: selected.value.source, owned: selected.value.owned } : null })
   }
   function saveCheckpoint(id) { workspace?.saveCheckpoint(id, view(id)) }
   function expireLogin() {
+    previewFile.value = null
+    newSessionOpen.value = false
     const wasLogged = logged.value === true
     if (selected.value) saveCheckpoint(selected.value.id)
     savePreferences(); closeStream(); logged.value = false
@@ -88,16 +117,24 @@ export function useHaven() {
   async function logout() {
     try { await api('/api/logout', { method: 'POST', body: '{}' }) } catch (e) { if (e.status !== 401) { notice.value = '退出未完成，请恢复连接后重试。'; return } }
     savePreferences(); if (selected.value) saveCheckpoint(selected.value.id)
-    closeStream(); selectionEpoch++; listEpoch++; logged.value = false; selected.value = null; messages.value = []; password.value = ''
+    closeStream(); selectionEpoch++; listEpoch++; logged.value = false; selected.value = null; messages.value = []; password.value = ''; previewFile.value = null; newSessionOpen.value = false
   }
   async function initialize() {
     closeStream(); selectionEpoch++; listEpoch++; searchEpoch++
     for (const key of Object.keys(drafts)) delete drafts[key]
     for (const key of Object.keys(runs)) delete runs[key]
+    for (const key of Object.keys(controlDrafts)) delete controlDrafts[key]
     for (const key of Object.keys(outgoing)) delete outgoing[key]
+    for (const key of Object.keys(uploadingIDs)) delete uploadingIDs[key]
+    for (const rows of [sessionModels, settingsReady, settingsErrors]) for (const key of Object.keys(rows)) delete rows[key]
+    settingsSavingIDs.clear(); settingsLoadingIDs.clear(); newSessionOpen.value = false
+    modelsEpoch++; modelsLoading.value = false; modelCatalog.value = { providers: [], model: '', provider: '' }; modelsError.value = ''
+    previewFile.value = null
     selected.value = null; messages.value = []; filter.value = ''; sessions.value = []; globalNotice.value = ''
     workspace = createWorkspace(localStorage, identity.value.username, message => { globalNotice.value = message })
     const prefs = workspace.preferences(); section.value = prefs.section === 'history' ? 'history' : 'mine'
+    newSessionDefaults.value = normalizeSettings(prefs.newSessionSettings); newSessionSettings.value = normalizeSettings(newSessionDefaults.value)
+    loadModels()
     await Promise.all([loadSessions(), checkHealth()])
     if (!logged.value) return
     if (prefs.selected?.id && /^[A-Za-z0-9_-]{1,160}$/.test(prefs.selected.id)) {
@@ -106,6 +143,39 @@ export function useHaven() {
     }
   }
   async function checkHealth() { try { await api('/api/health'); health.value = 'online' } catch { health.value = 'offline' } }
+  async function loadModels() {
+    if (modelsLoading.value) return
+    const currentWorkspace = workspace, epoch = ++modelsEpoch
+    modelsLoading.value = true; modelsError.value = ''
+    try { const data = await api('/api/models'); if (workspace === currentWorkspace && logged.value) modelCatalog.value = { providers: [], ...data } }
+    catch (e) { if (workspace === currentWorkspace && logged.value) modelsError.value = e.message }
+    finally { if (epoch === modelsEpoch) modelsLoading.value = false }
+  }
+  async function loadSettings(id = selected.value?.id) {
+    if (!id || settingsLoadingIDs.has(id) || settingsSavingIDs.has(id)) return
+    const currentWorkspace = workspace
+    settingsLoadingIDs.add(id); settingsErrors[id] = ''
+    try {
+      const value = await api(`/api/sessions/${id}/settings`)
+      if (workspace === currentWorkspace && logged.value) { sessionModels[id] = normalizeSettings(value); settingsReady[id] = true }
+    } catch (e) { if (workspace === currentWorkspace && logged.value) { settingsReady[id] = false; settingsErrors[id] = '无法读取会话设置：' + e.message } }
+    finally { if (workspace === currentWorkspace) settingsLoadingIDs.delete(id) }
+  }
+  async function saveSettings(value) {
+    const id = selected.value?.id
+    if (!id || !settingsReady[id] || settingsLoadingIDs.has(id) || settingsSavingIDs.has(id)) return
+    const previous = currentSettings.value, next = normalizeSettings(value), currentWorkspace = workspace
+    sessionModels[id] = next; settingsSavingIDs.add(id); settingsErrors[id] = ''
+    try {
+      const saved = await api(`/api/sessions/${id}/settings`, { method: 'PUT', body: JSON.stringify(next) })
+      if (workspace !== currentWorkspace || !logged.value) return
+      sessionModels[id] = normalizeSettings(saved)
+      newSessionDefaults.value = normalizeSettings(saved)
+      if (!newSessionOpen.value) newSessionSettings.value = normalizeSettings(saved)
+      savePreferences()
+    } catch (e) { if (workspace === currentWorkspace && logged.value) { sessionModels[id] = previous; settingsErrors[id] = '设置未保存：' + e.message } }
+    finally { if (workspace === currentWorkspace) settingsSavingIDs.delete(id) }
+  }
   async function loadSessions(more = false) {
     if (sessionsLoading.value && more) return
     const epoch = more ? listEpoch : ++listEpoch
@@ -148,7 +218,7 @@ export function useHaven() {
     const checkpoint = workspace?.checkpoint(session.id)
     if (checkpoint?.runID && !runs[session.id]) Object.assign(view(session.id), checkpoint, { connected: false, retries: 0 })
     savePreferences()
-    try { await loadMessages(false, epoch); if (epoch === selectionEpoch) await recover(session.id) }
+    try { await Promise.all([loadMessages(false, epoch), loadSettings(session.id)]); if (epoch === selectionEpoch) await recover(session.id) }
     catch (e) { if (epoch === selectionEpoch) { view(session.id).notice = e.message; if (e.status === 404) { selected.value = null; savePreferences() } } }
     finally { if (epoch === selectionEpoch) { loading.value = false; scrollBottom() } }
   }
@@ -166,12 +236,18 @@ export function useHaven() {
     if (older) await nextTick(() => { if (element) element.scrollTop = oldTop + element.scrollHeight - oldHeight })
   }
   async function moreHistory() { if (olderLoading.value) return; olderLoading.value = true; try { await loadMessages(true) } catch (e) { notice.value = e.message } finally { olderLoading.value = false } }
+  function openNewSession() { newSessionSettings.value = normalizeSettings(newSessionDefaults.value); newSessionError.value = ''; newSessionOpen.value = true; sidebar.value = false; if (!modelCatalog.value.providers.length) loadModels() }
   async function createSession() {
+    if (creatingSession.value) return
+    creatingSession.value = true; newSessionError.value = ''
     try {
-      const data = await api('/api/sessions', { method: 'POST', body: '{}' })
-      const session = { id: data.id, owned: true, haven_title: data.title, source: 'api_server' }
+      const settings = normalizeSettings(newSessionSettings.value)
+      const data = await api('/api/sessions', { method: 'POST', body: JSON.stringify({ settings }) })
+      const session = { id: data.id, owned: true, haven_title: data.title, source: 'api_server', settings: data.settings }
+      newSessionDefaults.value = settings; newSessionOpen.value = false; savePreferences()
       sessions.value.unshift(session); section.value = 'mine'; await choose(session)
-    } catch (e) { notice.value = e.message }
+    } catch (e) { newSessionError.value = e.message }
+    finally { creatingSession.value = false }
   }
   function startRename() { titleDraft.value = selectedTitle.value; editing.value = true }
   async function rename() {
@@ -184,22 +260,34 @@ export function useHaven() {
     } catch (e) { view(id).notice = e.message }
   }
 
-  async function uploadImages(chosen) {
+  async function uploadFiles(chosen) {
     if (!selected.value || composerLocked.value) return
-    const id = selected.value.id, row = draft(id)
-    if (chosen.length + row.files.length + (uploadingIDs[id] || 0) > 4) { view(id).notice = '一次最多上传 4 张图片'; return }
-    uploadingIDs[id] = (uploadingIDs[id] || 0) + chosen.length
-    for (const file of chosen) {
+    const id = selected.value.id, row = draft(id), currentWorkspace = workspace
+    const issue = validateUploads(row.files, chosen, uploadingIDs[id] || [])
+    if (issue) { view(id).notice = issue; return }
+    const jobs = chosen.map(file => ({ id: randomToken(), name: file.name, size: file.size, type: file.type, state: 'queued' }))
+    uploadingIDs[id] = [...(uploadingIDs[id] || []), ...jobs]
+    for (const [index, file] of chosen.entries()) {
+      const job = jobs[index]
       try {
+        if (workspace !== currentWorkspace || !logged.value) continue
+        const active = uploadingIDs[id]?.find(item => item.id === job.id); if (active) active.state = 'uploading'
         const form = new FormData(); form.append('file', file)
         const data = await api('/api/uploads', { method: 'POST', body: form })
-        row.files.push({ ...data, preview: '/api/uploads/' + data.id }); persist(id)
-      } catch (e) { view(id).notice = e.message } finally { uploadingIDs[id]-- }
+        if (workspace !== currentWorkspace || !logged.value) continue
+        const attachment = normalizeAttachment(data)
+        if (!attachment) throw new Error('服务器没有返回有效的附件编号')
+        row.files.push(attachment); persist(id)
+      } catch (e) { if (workspace === currentWorkspace) view(id).notice = file.name + '：' + e.message }
+      finally { if (workspace === currentWorkspace) uploadingIDs[id] = (uploadingIDs[id] || []).filter(item => item.id !== job.id) }
     }
   }
-  async function attach(event) { const chosen = Array.from(event.target.files || []); event.target.value = ''; await uploadImages(chosen) }
-  function pasteImages(event) { const chosen = Array.from(event.clipboardData?.items || []).filter(x => x.kind === 'file' && x.type.startsWith('image/')).map(x => x.getAsFile()).filter(Boolean); if (chosen.length) { event.preventDefault(); uploadImages(chosen) } }
+  async function attach(event) { const chosen = Array.from(event.target.files || []); event.target.value = ''; await uploadFiles(chosen) }
+  function dropFiles(event) { const chosen = Array.from(event.dataTransfer?.files || []); if (chosen.length) uploadFiles(chosen) }
+  function pasteImages(event) { const chosen = Array.from(event.clipboardData?.items || []).filter(x => x.kind === 'file' && x.type.startsWith('image/')).map(x => x.getAsFile()).filter(Boolean); if (chosen.length) { event.preventDefault(); uploadFiles(chosen) } }
   function removeImage(index) { if (!selected.value || composerLocked.value) return; draft(selected.value.id).files.splice(index, 1); persist(selected.value.id) }
+  function openPreview(file) { previewFile.value = normalizeAttachment(file) }
+  const loadPreviewText = id => api('/api/uploads/' + id + '/preview')
 
   function accepted(id, request, runID, nextStatus) {
     const row = draft(id), current = view(id)
@@ -212,10 +300,10 @@ export function useHaven() {
     current.status = nextStatus || 'started'; saveCheckpoint(id)
   }
   async function send() {
-    if (!selected.value || composerLocked.value || uploading.value || (!text.value.trim() && !files.value.length)) return
+    if (!selected.value || composerLocked.value || settingsBlocked.value || uploading.value || (!text.value.trim() && !files.value.length)) return
     const id = selected.value.id, row = draft(id), existing = workspace?.draft(id).pending
     if (existing) { row.pending = existing; persist(id); await recover(id); return }
-    row.pending = { text: row.text, images: row.files.map(f => f.id), request_id: randomToken(), created_at: Date.now() }; persist(id)
+    row.pending = { text: row.text, ...attachmentPayload(row.files), settings: currentSettings.value, request_id: randomToken(), created_at: Date.now() }; persist(id)
     saveOutgoing(id, createOutgoingMessage(row.pending, row.files, messages.value)); scrollBottom()
     await submitPending(id)
   }
@@ -276,17 +364,21 @@ export function useHaven() {
   }
   function listen(id, runID) {
     if (!logged.value || selected.value?.id !== id) return
+    if (stream?.havenRunID === runID && stream?.havenSessionID === id) return
     closeStream(); const current = view(id)
     const es = new EventSource(`/api/sessions/${encodeURIComponent(id)}/events?run_id=${encodeURIComponent(runID)}&last_seq=${current.lastSeq}`)
     stream = es
+    es.havenRunID = runID; es.havenSessionID = id
     es.onopen = () => { if (stream !== es) return; current.connected = true; current.retries = 0; health.value = 'online'; clearConnectionNotice(current) }
     es.onmessage = async event => {
       if (stream !== es || selected.value?.id !== id) return
       let data; try { data = JSON.parse(event.data) } catch { return }
       const result = applyRunEvent(current, data)
       if (result.duplicate) return
+      if (result.controlsChanged) await recover(id)
       clearTimeout(checkpointTimer); checkpointTimer = setTimeout(() => saveCheckpoint(id), 150)
       if (result.terminal) {
+        current.recoveryVersion = (current.recoveryVersion || 0) + 1
         closeStream(); current.connected = false; saveCheckpoint(id)
         try { await loadMessages(false); if (current.runID === runID) { current.liveText = ''; current.tools = current.tools.filter(t => t.state === 'error'); saveCheckpoint(id) }; await loadSessions() }
         catch (e) { current.notice = '运行已结束，历史暂未恢复：' + e.message; scheduleRecover(id) }
@@ -298,19 +390,25 @@ export function useHaven() {
   async function recover(id = selected.value?.id) {
     if (!id || !logged.value) return
     const current = view(id)
+    const accountWorkspace = workspace
+    const recoveryVersion = (current.recoveryVersion || 0) + 1; current.recoveryVersion = recoveryVersion
+    current.controlsSyncing = true
     try {
       if (draft(id).pending) await checkPending(id)
-      const recoveryVersion = (current.recoveryVersion || 0) + 1; current.recoveryVersion = recoveryVersion
       const data = await api(`/api/sessions/${id}/status`)
-      if (!logged.value || recoveryVersion !== current.recoveryVersion) return
+      if (!logged.value || accountWorkspace !== workspace || recoveryVersion !== current.recoveryVersion) return
       clearConnectionNotice(current)
       if (data.status === 'submission_unknown') {
-        if (!draft(id).pending) { draft(id).pending = { text: data.text || '', images: data.images || [], request_id: data.request_id, created_at: data.created_at ? Date.parse(data.created_at) : 1 }; persist(id) }
+        if (!draft(id).pending) { draft(id).pending = { text: data.text || '', images: data.images || [], files: data.files || [], settings: data.settings, request_id: data.request_id, created_at: data.created_at ? Date.parse(data.created_at) : 1 }; persist(id) }
         current.status = 'submission_unknown'; current.notice = '此会话有待确认的发送，已恢复原请求。请先核对结果。'; scheduleRecover(id); return
       }
       if (draft(id).pending) { scheduleRecover(id); return }
-      if (data.run_id && current.runID !== data.run_id) Object.assign(current, emptyRun(), { runID: data.run_id })
+      if (data.run_id && current.runID !== data.run_id) Object.assign(current, emptyRun(), { runID: data.run_id, recoveryVersion })
       current.status = data.status || 'idle'
+      const previousControls = current.controls.map(p => p.key).join('|')
+      current.controls = pendingControls(data); current.controlsVerified = true
+      if (current.controls.length && previousControls !== current.controls.map(p => p.key).join('|') && selected.value?.id === id) scrollBottom()
+      if (current.status === 'waiting_for_approval' && !Array.isArray(data.pending_controls)) current.notice = '当前 Hermes 未提供可核对的审批编号，请在原入口处理或停止运行。'
       if (data.error) current.notice = errorText(data.error)
       if (uncertainStatuses.has(current.status)) current.notice = 'Hermes 无法确认该运行是否完成，请核对历史；当前不会自动重新执行。'
       if (activeStatuses.has(current.status) && data.run_id && selected.value?.id === id) listen(id, data.run_id)
@@ -319,9 +417,62 @@ export function useHaven() {
       else current.retries = 0
       if (data.run_id) health.value = 'online'
     } catch (e) {
-      if (!logged.value) return
-      if (e.status === 404) { current.status = 'unavailable'; current.notice = '实时运行记录已不可用，请以保存的会话历史为准。'; return }
+      if (!logged.value || accountWorkspace !== workspace || recoveryVersion !== current.recoveryVersion) return
+      current.controlsVerified = false
+      if (e.status === 404) { current.controls = []; current.status = 'unavailable'; current.notice = '实时运行记录已不可用，请以保存的会话历史为准。'; return }
       current.notice = '暂时无法核对运行状态：' + e.message; health.value = 'offline'; scheduleRecover(id)
+    } finally {
+      if (accountWorkspace === workspace && recoveryVersion === current.recoveryVersion) {
+        current.controlsSyncing = false
+        if (logged.value && selected.value?.id === id && activeStatuses.has(current.status)) {
+          clearTimeout(statusTimer); statusTimer = setTimeout(() => recover(id), 3000)
+        }
+      }
+    }
+  }
+  function answerControl(p, answer) {
+    if (!selected.value) return
+    const id = selected.value.id, state = controlState(id, p)
+    if (state.sending || state.unknown) return
+    state.answer = answer; workspace?.saveControl(id, p.key, state)
+  }
+  async function respondControl(p, value) {
+    if (!selected.value || controlsSyncing.value) return
+    const id = selected.value.id, current = view(id), state = controlState(id, p), accountWorkspace = workspace
+    if (state.sending || state.unknown || !current.controls.some(row => row.key === p.key)) return
+    if (p.kind === 'approval' ? !['once', 'deny'].includes(value) || !p.choices.includes(value) : !value.trim() || [...value].length > 16384) return
+    state.sending = true; state.unknown = true; state.error = ''
+    // 先保存不确定标记，页面关闭或响应丢失后也不会自动再次回答。
+    accountWorkspace?.saveControl(id, p.key, state)
+    const body = { run_id: p.run_id, request_id: p.prompt_id, execution_generation: p.execution_generation, [p.kind === 'approval' ? 'choice' : 'answer']: value }
+    try {
+      const result = await api(`/api/sessions/${id}/${p.kind}`, { method: 'POST', body: JSON.stringify(body) })
+      if (accountWorkspace !== workspace || !logged.value) return
+      state.unknown = false; state.answer = ''; accountWorkspace?.saveControl(id, p.key, state)
+      current.controls = current.controls.filter(row => row.key !== p.key)
+      current.notice = result.status === 'already_resolved' ? '该请求已由其他入口处理，正在核对最新状态。' : p.kind === 'clarify' ? '补充回答已提交，Hermes 将继续原运行。' : value === 'deny' ? '已拒绝这次请求。后续结果以 Hermes 返回为准。' : '已允许这次请求，Hermes 将继续原运行。'
+    } catch (e) {
+      if (accountWorkspace !== workspace) return
+      state.unknown = e.network || !e.status || e.status >= 500 || e.data?.code === 'control_result_unknown'
+      state.error = state.unknown ? '提交结果尚未确认，请先核对状态；不会自动重发。' : e.message
+      accountWorkspace?.saveControl(id, p.key, state)
+      if (e.status === 409) current.notice = '该请求已处理或已过期，正在核对最新状态。'
+    } finally {
+      state.sending = false
+      if (logged.value && accountWorkspace === workspace) await recover(id)
+    }
+  }
+  async function refreshControls() {
+    const id = selected.value?.id, accountWorkspace = workspace
+    if (!id) return
+    await recover(id)
+    if (!logged.value || workspace !== accountWorkspace || !view(id).controlsVerified) return
+    for (const p of view(id).controls) {
+      const state = controlState(id, p)
+      if (state.unknown && !state.sending) {
+        state.unknown = false; state.error = '已核对：Hermes 仍在等待此请求，可重新选择后提交。'
+        accountWorkspace?.saveControl(id, p.key, state)
+      }
     }
   }
   async function refreshStatus() { if (!selected.value) return; try { await loadMessages(false); await recover() } catch (e) { notice.value = e.message } }
@@ -337,6 +488,17 @@ export function useHaven() {
     if (logged.value && selected.value) { const id = selected.value.id; saveCheckpoint(id); closeStream(); view(id).notice = '网络已断开，草稿和发送记录已保留。恢复连接后会重新核对运行。'; scheduleRecover(id) }
   }
   function storageChanged(event) {
+    if (workspace && selected.value && event.key?.startsWith(workspace.prefix + 'control:' + selected.value.id + ':')) {
+      const id = selected.value.id
+      for (const p of view(id).controls) {
+        const state = controlState(id, p)
+        if (!state.sending) {
+          Object.assign(state, workspace.control(id, p.key))
+          if (state.unknown) state.error = '其他页面可能正在处理此请求，请先核对状态；不会自动重发。'
+        }
+      }
+      recover(id)
+    }
     if (workspace && selected.value && event.key === workspace.prefix + 'outgoing:' + selected.value.id) {
       const id = selected.value.id, incoming = workspace.outgoing(id)
       if (incoming) outgoing[id] = incoming
@@ -356,5 +518,5 @@ export function useHaven() {
   })
   onUnmounted(() => { beforeUnload(); closeStream(); clearTimeout(searchTimer); window.removeEventListener('online', online); window.removeEventListener('offline', offline); window.removeEventListener('storage', storageChanged); window.removeEventListener('pagehide', beforeUnload) })
 
-  return { logged, username, password, identity, loginError, signingIn, sessions, filter, section, selected, messages: visibleMessages, loading, sidebar, editing, titleDraft, hasOlder, scroller, picker, health, sessionsLoading, hasMoreSessions, searching, olderLoading, globalNotice, text, files, pending, status, tools, liveText, sending, uploading, isBusy, isUncertain, composerLocked, mine, notice, filtered, selectedTitle, statusLabel, sourceName, sessionTitle, timeLabel, login, logout, checkHealth, loadMoreSessions, choose, moreHistory, createSession, startRename, rename, attach, pasteImages, removeImage, send, retryPending, acknowledgePending, refreshStatus, stop, render }
+  return { modelCatalog, modelsLoading, modelsError, loadModels, currentSettings, settingsLoading, settingsSaving, settingsBlocked, settingsError, saveSettings, loadSettings, newSessionOpen, newSessionSettings, newSessionError, creatingSession, openNewSession, controls, controlsSyncing, answerControl, respondControl, refreshControls, logged, username, password, identity, loginError, signingIn, sessions, filter, section, selected, messages: visibleMessages, loading, sidebar, editing, titleDraft, hasOlder, scroller, picker, health, sessionsLoading, hasMoreSessions, searching, olderLoading, globalNotice, text, files, pending, status, tools, liveText, sending, uploading, uploadQueue, previewFile, openPreview, loadPreviewText, dropFiles, isBusy, isUncertain, composerLocked, mine, notice, filtered, selectedTitle, statusLabel, sourceName, sessionTitle, timeLabel, login, logout, checkHealth, loadMoreSessions, choose, moreHistory, createSession, startRename, rename, attach, pasteImages, removeImage, send, retryPending, acknowledgePending, refreshStatus, stop, render }
 }

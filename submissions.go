@@ -32,6 +32,7 @@ type submission struct {
 	FrozenInput       json.RawMessage `json:"frozen_input,omitempty"`
 	ContextNote       string          `json:"context_note,omitempty"`
 	OutputDir         string          `json:"output_dir,omitempty"`
+	Settings          *modelSettings  `json:"settings,omitempty"`
 	Code              int             `json:"code,omitempty"`
 	Reply             json.RawMessage `json:"reply,omitempty"`
 }
@@ -73,10 +74,13 @@ func openSubmissions(dir string) (*submissionStore, error) {
 			return nil, errors.New("发送记录版本不受支持")
 		}
 		if rec.Version == 2 {
+			if rec.Settings != nil && !rec.Settings.valid() {
+				return nil, errors.New("发送记录中的模型设置无效")
+			}
 			if !json.Valid(rec.FrozenInput) || rec.ContextNote == "" || rec.OutputDir == "" || rec.ClientFingerprint != clientFingerprint(rec.Text, rec.Images, rec.Files) {
 				return nil, errors.New("附件发送记录损坏，已停止启动")
 			}
-			raw, _ := json.Marshal(map[string]any{"session_id": rec.SessionID, "input": rec.FrozenInput})
+			raw, _ := json.Marshal(runPayload(rec.SessionID, rec.FrozenInput, rec.Settings))
 			if digest(string(raw)) != rec.Fingerprint {
 				return nil, errors.New("冻结的发送内容校验失败")
 			}
@@ -190,12 +194,27 @@ func (s *server) canRetry(ctx context.Context, rec submission) bool {
 	return i.Supported && i.Durable && i.Retention > 60 && time.Since(rec.CreatedAt) < time.Duration(i.Retention-60)*time.Second
 }
 
-func (s *server) submit(w http.ResponseWriter, r *http.Request, id, requestID, text string, images, files []string, createdAt int64) {
+func (s *server) submit(w http.ResponseWriter, r *http.Request, id, requestID, text string, images, files []string, createdAt int64, settings *modelSettings) {
 	lock, _ := s.submitLocks.LoadOrStore(id, &sync.Mutex{})
 	mu := lock.(*sync.Mutex)
 	mu.Lock()
 	defer mu.Unlock()
 	rec, exists := s.submissions.get(id, requestID)
+	if exists {
+		frozen := modelSettings{}
+		if rec.Settings != nil {
+			frozen = *rec.Settings
+		}
+		if settings != nil && *settings != frozen {
+			jsonOut(w, 409, map[string]any{"error": "同一请求编号不能更换模型或思考强度", "code": "request_conflict"})
+			return
+		}
+		// 重试只使用原发送记录；后来的会话设置不会改变已经提交的请求。
+		settings = rec.Settings
+	} else if settings == nil {
+		saved := s.savedSettings(id)
+		settings = &saved
+	}
 	if exists && rec.State == "acknowledged" {
 		jsonOut(w, 409, map[string]any{"error": "此请求已由用户核对并关闭，不能再次执行", "code": "request_acknowledged"})
 		return
@@ -220,7 +239,7 @@ func (s *server) submit(w http.ResponseWriter, r *http.Request, id, requestID, t
 			return
 		}
 	}
-	payload := map[string]any{"session_id": id, "input": input}
+	payload := runPayload(id, input, settings)
 	raw, _ := json.Marshal(payload)
 	fingerprint := digest(string(raw))
 	if exists && rec.Fingerprint != fingerprint {
@@ -275,7 +294,7 @@ func (s *server) submit(w http.ResponseWriter, r *http.Request, id, requestID, t
 			}
 		}
 		frozen, _ := json.Marshal(input)
-		rec = submission{Version: 2, SessionID: id, RequestID: requestID, Fingerprint: fingerprint, Scope: digest(s.hermesURL + "\n" + s.apiKey), State: "unknown", CreatedAt: started, Text: text, Images: images, Files: files, ClientFingerprint: clientFingerprint(text, images, files), FrozenInput: frozen, ContextNote: contextNote, OutputDir: outputDir}
+		rec = submission{Version: 2, SessionID: id, RequestID: requestID, Fingerprint: fingerprint, Scope: digest(s.hermesURL + "\n" + s.apiKey), State: "unknown", CreatedAt: started, Text: text, Images: images, Files: files, ClientFingerprint: clientFingerprint(text, images, files), FrozenInput: frozen, ContextNote: contextNote, OutputDir: outputDir, Settings: settings}
 		if err := s.submissions.save(rec); err != nil {
 			fail(w, 503, "无法保存发送记录，本次未提交给 Hermes")
 			return
@@ -371,6 +390,7 @@ func (s *server) requestStatus(w http.ResponseWriter, r *http.Request, id, reque
 		v["text"] = rec.Text
 		v["images"] = rec.Images
 		v["files"] = rec.Files
+		v["settings"] = rec.Settings
 	}
 	if rec.State == "rejected" {
 		var reply any
@@ -424,7 +444,7 @@ func (s *server) sessionRun(id string) string {
 }
 func (s *server) sessionStatus(w http.ResponseWriter, r *http.Request, id string) {
 	if rec, ok := s.submissions.latest(id, true); ok {
-		jsonOut(w, 200, map[string]any{"status": "submission_unknown", "request_id": rec.RequestID, "text": rec.Text, "images": rec.Images, "files": rec.Files, "created_at": rec.CreatedAt})
+		jsonOut(w, 200, map[string]any{"status": "submission_unknown", "request_id": rec.RequestID, "text": rec.Text, "images": rec.Images, "files": rec.Files, "created_at": rec.CreatedAt, "settings": rec.Settings})
 		return
 	}
 	run := s.sessionRun(id)

@@ -1,3 +1,5 @@
+import { normalizeAttachment, attachmentPayload } from './attachments.js'
+
 export function emptyDraft() { return { text: '', files: [], pending: null } }
 
 export function createWorkspace(storage, username, onError = () => {}) {
@@ -19,16 +21,21 @@ export function createWorkspace(storage, username, onError = () => {}) {
       return value && typeof value.requestID === 'string' && Array.isArray(value.before) && value.message?.role === 'user' ? value : null
     },
     saveOutgoing: (id, value) => write('outgoing:' + id, value),
+    control(id, key) {
+      const value = read('control:' + id + ':' + key, {})
+      return { answer: typeof value?.answer === 'string' ? value.answer : '', unknown: value?.unknown === true }
+    },
+    saveControl: (id, key, value) => write('control:' + id + ':' + key, { answer: value.answer, unknown: value.unknown }),
     draft(id) {
       const value = read('draft:' + id, null)
       if (!value || typeof value.text !== 'string' || !Array.isArray(value.files)) return emptyDraft()
       return {
         text: value.text,
-        files: value.files.filter(f => /^[a-f0-9]{40}$/.test(f.id) && typeof f.name === 'string').slice(0, 4).map(f => ({ id: f.id, name: f.name, mime: f.mime, preview: '/api/uploads/' + f.id })),
+        files: value.files.map(normalizeAttachment).filter(Boolean).slice(0, 4),
         pending: value.pending && typeof value.pending.request_id === 'string' ? value.pending : null,
       }
     },
-    saveDraft: (id, value) => write('draft:' + id, { text: value.text, files: value.files.map(({ id, name, mime }) => ({ id, name, mime })), pending: value.pending }),
+    saveDraft: (id, value) => write('draft:' + id, { text: value.text, files: value.files.map(({ id, name, mime, size, kind, preview_kind }) => ({ id, name, mime, size, kind, preview_kind })), pending: value.pending }),
     checkpoint(id) { return read('run:' + id, null) },
     saveCheckpoint(id, view) {
       // 序号和对应内容一起保存，避免刷新后跳过尚未恢复的文字和工具事件。
@@ -39,7 +46,8 @@ export function createWorkspace(storage, username, onError = () => {}) {
 }
 
 export function samePayload(pending, draft) {
-  return pending?.text === draft.text && JSON.stringify(pending?.images || []) === JSON.stringify(draft.files.map(f => f.id))
+  const payload = attachmentPayload(draft.files)
+  return pending?.text === draft.text && JSON.stringify(pending?.images || []) === JSON.stringify(payload.images) && JSON.stringify(pending?.files || []) === JSON.stringify(payload.files)
 }
 
 export function mergeMessages(older, newer) {
