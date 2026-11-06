@@ -18,6 +18,7 @@ export function useHaven() {
   const sessions = ref([]), filter = ref(''), section = ref('mine'), selected = ref(null), messages = ref([]), loading = ref(false)
   const sidebar = ref(false), editing = ref(false), titleDraft = ref(''), hasOlder = ref(false), scroller = ref(null), picker = ref(null)
   const health = ref('connecting'), sessionsLoading = ref(false), hasMoreSessions = ref(false), searching = ref(false), olderLoading = ref(false), globalNotice = ref('')
+  const olderError = ref('')
   const drafts = reactive({}), runs = reactive({}), sendingIDs = reactive(new Set()), uploadingIDs = reactive({})
   const previewFile = ref(null)
   const outgoing = reactive({})
@@ -29,6 +30,7 @@ export function useHaven() {
   let workspace = null, stream = null, pollTimer = null, searchTimer = null, checkpointTimer = null, statusTimer = null
   let selectionEpoch = 0, listEpoch = 0, messageOffset = 0, sessionOffset = 0, searchEpoch = 0
   let modelsEpoch = 0
+  let historyEpoch = 0, historyTimer = null, historyFailures = 0, historyRefreshing = false
 
   function view(id) { return runs[id] || (runs[id] = emptyRun()) }
   function draft(id) { return drafts[id] || (drafts[id] = workspace?.draft(id) || emptyDraft()) }
@@ -85,6 +87,7 @@ export function useHaven() {
   }
   function saveCheckpoint(id) { workspace?.saveCheckpoint(id, view(id)) }
   function expireLogin() {
+    resetHistoryLoading()
     previewFile.value = null
     newSessionOpen.value = false
     const wasLogged = logged.value === true
@@ -117,9 +120,11 @@ export function useHaven() {
   async function logout() {
     try { await api('/api/logout', { method: 'POST', body: '{}' }) } catch (e) { if (e.status !== 401) { notice.value = '退出未完成，请恢复连接后重试。'; return } }
     savePreferences(); if (selected.value) saveCheckpoint(selected.value.id)
+    resetHistoryLoading()
     closeStream(); selectionEpoch++; listEpoch++; logged.value = false; selected.value = null; messages.value = []; password.value = ''; previewFile.value = null; newSessionOpen.value = false
   }
   async function initialize() {
+    resetHistoryLoading()
     closeStream(); selectionEpoch++; listEpoch++; searchEpoch++
     for (const key of Object.keys(drafts)) delete drafts[key]
     for (const key of Object.keys(runs)) delete runs[key]
@@ -210,8 +215,18 @@ export function useHaven() {
   })
   watch(section, savePreferences)
 
-  function scrollBottom() { nextTick(() => { if (scroller.value) scroller.value.scrollTop = scroller.value.scrollHeight }) }
+  function clearHistoryTimer() { clearTimeout(historyTimer); historyTimer = null }
+  function resetHistoryLoading() {
+    clearHistoryTimer(); historyEpoch++; historyFailures = 0; historyRefreshing = false
+    olderLoading.value = false; olderError.value = ''
+  }
+  function onHistoryScroll() {
+    if (!logged.value || !selected.value || loading.value || historyRefreshing || olderLoading.value || historyTimer !== null || !hasOlder.value) return
+    if (scroller.value && scroller.value.scrollTop <= 600) return moreHistory()
+  }
+  function scrollBottom() { nextTick(() => { if (scroller.value) { scroller.value.scrollTop = scroller.value.scrollHeight; onHistoryScroll() } }) }
   async function choose(session) {
+    resetHistoryLoading()
     if (selected.value) saveCheckpoint(selected.value.id)
     closeStream(); const epoch = ++selectionEpoch
     selected.value = session; draft(session.id); outgoingFor(session.id); editing.value = false; sidebar.value = false; messages.value = []; messageOffset = 0; hasOlder.value = false; loading.value = true
@@ -224,18 +239,39 @@ export function useHaven() {
   }
   async function loadMessages(older, epoch = selectionEpoch) {
     if (!selected.value) return
+    if (!older) { resetHistoryLoading(); historyRefreshing = true }
+    const revision = historyEpoch
     const id = selected.value.id, next = older ? messageOffset + 100 : 0
-    const data = await api(`/api/sessions/${encodeURIComponent(id)}/messages?offset=${next}`)
-    if (epoch !== selectionEpoch || selected.value?.id !== id) return
-    const rows = data.data || []
-    if (data.history_notice) view(id).notice = data.history_notice
-    const element = scroller.value, oldHeight = element?.scrollHeight || 0, oldTop = element?.scrollTop || 0
-    messages.value = older ? mergeMessages(rows, messages.value) : rows
-    if (outgoingFor(id) && !reconcileOutgoing(messages.value, outgoingFor(id))) saveOutgoing(id, null)
-    messageOffset = next; hasOlder.value = rows.length === 100
-    if (older) await nextTick(() => { if (element) element.scrollTop = oldTop + element.scrollHeight - oldHeight })
+    try {
+      const data = await api(`/api/sessions/${encodeURIComponent(id)}/messages?offset=${next}`)
+      // 刷新历史或切换会话后，旧分页响应不能覆盖新列表及其滚动位置。
+      if (epoch !== selectionEpoch || revision !== historyEpoch || selected.value?.id !== id || !logged.value) return
+      const rows = data.data || []
+      if (data.history_notice) view(id).notice = data.history_notice
+      const element = scroller.value, oldHeight = element?.scrollHeight || 0, oldTop = element?.scrollTop || 0
+      messages.value = older ? mergeMessages(rows, messages.value) : rows
+      if (outgoingFor(id) && !reconcileOutgoing(messages.value, outgoingFor(id))) saveOutgoing(id, null)
+      messageOffset = next; hasOlder.value = rows.length === 100
+      if (older) await nextTick(() => { if (element && scroller.value === element && revision === historyEpoch && epoch === selectionEpoch) element.scrollTop = oldTop + element.scrollHeight - oldHeight })
+    } finally {
+      if (!older && revision === historyEpoch) { historyRefreshing = false; nextTick(onHistoryScroll) }
+    }
   }
-  async function moreHistory() { if (olderLoading.value) return; olderLoading.value = true; try { await loadMessages(true) } catch (e) { notice.value = e.message } finally { olderLoading.value = false } }
+  async function moreHistory() {
+    const revision = historyEpoch
+    olderLoading.value = true; olderError.value = ''
+    let retryDelay = 0
+    try { await loadMessages(true); if (revision === historyEpoch) historyFailures = 0 }
+    catch (e) {
+      if (revision === historyEpoch) { olderError.value = e.message; retryDelay = Math.min(3000 * 2 ** historyFailures++, 30000) }
+    } finally {
+      if (revision === historyEpoch) {
+        olderLoading.value = false
+        // 逐页串行补足顶部缓冲区；失败后退避重试，离开顶部后停止预加载。
+        if (logged.value && hasOlder.value) historyTimer = setTimeout(() => { historyTimer = null; onHistoryScroll() }, retryDelay)
+      }
+    }
+  }
   function openNewSession() { newSessionSettings.value = normalizeSettings(newSessionDefaults.value); newSessionError.value = ''; newSessionOpen.value = true; sidebar.value = false; if (!modelCatalog.value.providers.length) loadModels() }
   async function createSession() {
     if (creatingSession.value) return
@@ -516,7 +552,7 @@ export function useHaven() {
     window.addEventListener('online', online); window.addEventListener('offline', offline); window.addEventListener('storage', storageChanged); window.addEventListener('pagehide', beforeUnload)
     try { identity.value = await api('/api/me'); logged.value = true; await initialize() } catch (e) { logged.value = false; if (e.network) loginError.value = '无法连接服务器，请恢复网络后重试。' }
   })
-  onUnmounted(() => { beforeUnload(); closeStream(); clearTimeout(searchTimer); window.removeEventListener('online', online); window.removeEventListener('offline', offline); window.removeEventListener('storage', storageChanged); window.removeEventListener('pagehide', beforeUnload) })
+  onUnmounted(() => { resetHistoryLoading(); beforeUnload(); closeStream(); clearTimeout(searchTimer); window.removeEventListener('online', online); window.removeEventListener('offline', offline); window.removeEventListener('storage', storageChanged); window.removeEventListener('pagehide', beforeUnload) })
 
-  return { modelCatalog, modelsLoading, modelsError, loadModels, currentSettings, settingsLoading, settingsSaving, settingsBlocked, settingsError, saveSettings, loadSettings, newSessionOpen, newSessionSettings, newSessionError, creatingSession, openNewSession, controls, controlsSyncing, answerControl, respondControl, refreshControls, logged, username, password, identity, loginError, signingIn, sessions, filter, section, selected, messages: visibleMessages, loading, sidebar, editing, titleDraft, hasOlder, scroller, picker, health, sessionsLoading, hasMoreSessions, searching, olderLoading, globalNotice, text, files, pending, status, tools, liveText, sending, uploading, uploadQueue, previewFile, openPreview, loadPreviewText, dropFiles, isBusy, isUncertain, composerLocked, mine, notice, filtered, selectedTitle, statusLabel, sourceName, sessionTitle, timeLabel, login, logout, checkHealth, loadMoreSessions, choose, moreHistory, createSession, startRename, rename, attach, pasteImages, removeImage, send, retryPending, acknowledgePending, refreshStatus, stop, render }
+  return { olderError, onHistoryScroll, modelCatalog, modelsLoading, modelsError, loadModels, currentSettings, settingsLoading, settingsSaving, settingsBlocked, settingsError, saveSettings, loadSettings, newSessionOpen, newSessionSettings, newSessionError, creatingSession, openNewSession, controls, controlsSyncing, answerControl, respondControl, refreshControls, logged, username, password, identity, loginError, signingIn, sessions, filter, section, selected, messages: visibleMessages, loading, sidebar, editing, titleDraft, hasOlder, scroller, picker, health, sessionsLoading, hasMoreSessions, searching, olderLoading, globalNotice, text, files, pending, status, tools, liveText, sending, uploading, uploadQueue, previewFile, openPreview, loadPreviewText, dropFiles, isBusy, isUncertain, composerLocked, mine, notice, filtered, selectedTitle, statusLabel, sourceName, sessionTitle, timeLabel, login, logout, checkHealth, loadMoreSessions, choose, createSession, startRename, rename, attach, pasteImages, removeImage, send, retryPending, acknowledgePending, refreshStatus, stop, render }
 }

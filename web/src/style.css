@@ -144,7 +144,7 @@ button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-vis
 .tool-details pre{margin:4px 0 8px;max-height:300px;padding:9px;font-size:11px}
 .tool-detail-label{font-size:10px;color:var(--text-muted);margin:5px 0}
 .tool-group.has-errors{border-color:#edcdbf}
-.older{display:flex;align-items:center;gap:6px;color:var(--accent);background:none;border:0;font-size:11px;margin:0 auto 25px}
+.older{display:flex;align-items:center;justify-content:center;gap:6px;min-height:20px;line-height:20px;color:var(--text-muted);font-size:11px;margin:0 auto 25px}
 .thread-loading,.empty-thread{display:flex;align-items:center;gap:9px;color:var(--text-muted);font-size:12px;padding:20px 0}
 .live-label{display:flex;align-items:center;gap:7px;color:var(--accent)}
 .thinking{display:flex;gap:4px;padding:4px}
