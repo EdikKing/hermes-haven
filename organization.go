@@ -399,6 +399,11 @@ func (s *server) purgeSessionData(id string) error {
 	if err != nil && !os.IsNotExist(err) {
 		return err
 	}
+	if err != nil {
+		if _, statErr := os.Lstat(filepath.Join(s.dataDir, "file-links")); statErr == nil || !os.IsNotExist(statErr) {
+			return err
+		}
+	}
 	var removedLinks []string
 	for _, link := range links {
 		if link.IsDir() || filepath.Ext(link.Name()) != ".json" {

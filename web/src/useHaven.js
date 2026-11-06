@@ -403,6 +403,8 @@ export function useHaven() {
       await api(`/api/sessions/${id}`, { method: 'DELETE', body: JSON.stringify({ confirmed: true }) })
       if (workspace !== currentWorkspace || !logged.value) return
       forgetSession(id)
+      // 删除会使上游分页位置前移，重新加载首屏以免下一页漏掉会话。
+      await loadSessions(); scanSessions()
     } catch (e) {
       if (workspace === currentWorkspace && logged.value) {
         organizationError.value = e.message
